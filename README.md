@@ -1,10 +1,16 @@
-# grain-dynamics-sim
+# rough-slope-sim
 
-Physics simulation of a ball falling down a rough, inclined surface, with
+Physics simulation of a ball rolling down a rough, inclined surface, with
 tools to analyze how surface roughness affects the spread ("diffusion") of
 the ball's trajectories, and to relate abrasive grit size to measured
 surface roughness (Sa).
 
+This started as a single, 800-line Google Colab script (`thesis.py`) full of
+copy-pasted simulation loops and bare global variables. It has been
+refactored here into a small, tested, installable Python package with a
+clean API, a CLI, and no notebook-only assumptions (no `plt.show()` blocking
+calls, no reliance on globals surviving across cells, no undefined
+variables).
 
 ## What it does
 
