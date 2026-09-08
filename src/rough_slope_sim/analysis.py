@@ -1,12 +1,19 @@
 """Analysis, statistical metrics, spatial slicing, and diffusion calculations."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+
 import numpy as np
 from numpy.typing import NDArray
 from scipy.stats import ks_2samp, wasserstein_distance
 
-from rough_slope_sim.simulation import Trajectory
+from .simulation import Trajectory
+
+
+def _xy_arrays(t: Trajectory | NDArray) -> tuple[NDArray, NDArray]:
+    """Extracts (x, y) arrays from either a Trajectory or a raw [frame, x, y] array."""
+    if isinstance(t, Trajectory):
+        return t.x, t.y
+    return t[:, 1], t[:, 2]
 
 
 def trajectories_at_x_slice(
@@ -15,20 +22,38 @@ def trajectories_at_x_slice(
     """Interpolates lateral Y positions across all trajectories at a fixed downslope X plane."""
     y_interp_list = []
     for t in trajectories:
-        x_arr = t.x if isinstance(t, Trajectory) else t[:, 1]
-        y_arr = t.y if isinstance(t, Trajectory) else t[:, 2]
-
+        x_arr, y_arr = _xy_arrays(t)
         if x_arr is None or len(x_arr) < 2:
             continue
 
-        sort_idx = np.argsort(x_arr)
-        x_sorted, y_sorted = x_arr[sort_idx], y_arr[sort_idx]
+        # Check monotonic condition to avoid unnecessary sorting
+        if not np.all(x_arr[:-1] <= x_arr[1:]):
+            sort_idx = np.argsort(x_arr)
+            x_sorted, y_sorted = x_arr[sort_idx], y_arr[sort_idx]
+        else:
+            x_sorted, y_sorted = x_arr, y_arr
 
         if x_sorted[0] <= x_slice <= x_sorted[-1]:
-            y_interp = np.interp(x_slice, x_sorted, y_sorted)
-            y_interp_list.append(y_interp)
+            y_interp_list.append(np.interp(x_slice, x_sorted, y_sorted))
 
-    return np.array(y_interp_list)
+    return np.array(y_interp_list, dtype=np.float64)
+
+
+def variance_over_time(trajectories: list[Trajectory], attr: str = "y") -> NDArray[np.float64]:
+    """Cross-ensemble variance of `attr` at each simulation time step."""
+    arrays = [getattr(t, attr) for t in trajectories if len(getattr(t, attr)) > 0]
+    if not arrays:
+        return np.array([])
+
+    lens = [len(a) for a in arrays]
+    max_len = max(lens)
+    padded = np.full((len(arrays), max_len), np.nan, dtype=np.float64)
+
+    for i, a in enumerate(arrays):
+        padded[i, : len(a)] = a
+
+    with np.errstate(invalid="ignore"):
+        return np.nanvar(padded, axis=0)
 
 
 def compare_distributions(y_exp: NDArray[np.float64], y_sim: NDArray[np.float64]) -> dict[str, float]:
@@ -46,7 +71,8 @@ def compare_distributions(y_exp: NDArray[np.float64], y_sim: NDArray[np.float64]
 
     emd = wasserstein_distance(valid_exp, valid_sim)
     ks_stat, p_value = ks_2samp(valid_exp, valid_sim)
-    var_ratio = float(np.var(valid_exp) / np.var(valid_sim)) if np.var(valid_sim) > 0 else np.nan
+    var_sim = np.var(valid_sim)
+    var_ratio = float(np.var(valid_exp) / var_sim) if var_sim > 0 else np.nan
 
     return {
         "wasserstein_distance": float(emd),
@@ -88,6 +114,19 @@ def particle_size_from_grit(grit: float) -> float:
     return 173.014 * np.exp(-0.00408466 * grit) + 21.3533
 
 
-def particle_size_from_sa(sa: float) -> float:
-    """Calculates particle size from surface average roughness Sa."""
-    return 2.87515 * sa + 13.7870
+def get_experimental_start_position(
+    exp_trajectories: list[np.ndarray],
+) -> tuple[float, float]:
+    """Extracts the average starting (x, y) coordinates across all experimental trajectories.
+
+    Assumes each trajectory in `exp_trajectories` has shape (N, 3+) where:
+      - col 1: x position (cm)
+      - col 2: y position (cm)
+    """
+    if not exp_trajectories:
+        return 0.0, 0.0
+
+    x_starts = [t[0, 1] if isinstance(t, np.ndarray) else t.x[0] for t in exp_trajectories]
+    y_starts = [t[0, 2] if isinstance(t, np.ndarray) else t.y[0] for t in exp_trajectories]
+
+    return float(np.mean(x_starts)), float(np.mean(y_starts))

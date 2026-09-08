@@ -1,10 +1,11 @@
 """CLI entry point for executing simulations and generating analysis outputs."""
 
 from __future__ import annotations
-import numpy as np
 
 import argparse
 from pathlib import Path
+
+import numpy as np
 
 from rough_slope_sim import analysis, plotting
 from rough_slope_sim.config import BallConfig, EnsembleConfig, PhysicsConfig, TerrainConfig
@@ -25,6 +26,7 @@ def _save(fig, out_dir: Path, name: str) -> None:
 def run_pipeline(out_dir: Path, seed: int | None) -> None:
     terrain_config = TerrainConfig(roughness_transition_y=2.5, seed=seed)
     ball, physics = BallConfig(), PhysicsConfig()
+    physics.slope_angle = terrain_config.slope_angle  # keep the two in sync
     ensemble = EnsembleConfig(seed=seed, k_max=200)
 
     print("Generating terrain...")
