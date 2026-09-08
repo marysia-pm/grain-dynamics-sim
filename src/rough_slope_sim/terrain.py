@@ -1,327 +1,237 @@
-"""Terrain generation and surface representation for sandpaper micro-geometry using ISO 6344 standards and Nanovea benchmarks."""
+"""3D Terrain Generation Module with GPU (PyTorch CUDA) Acceleration and CPU Interpolation Support."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
-from scipy.interpolate import interp1d
-from scipy.spatial import cKDTree
+import torch
 
-from .config import TerrainConfig
-
-# Benchmark NANOVEA Profilometry Reference Data
-NANOVEA_DATA = {
-    "grit": np.array([120, 180, 320, 800, 2000], dtype=np.float64),
-    "diam_um": np.array([127.0, 105.6, 67.18, 28.16, 21.27], dtype=np.float64),
-    "Sa_um": np.array([42.37, 27.28, 17.92, 6.273, 3.639], dtype=np.float64),
+# Nanovea Profilometer Calibration Data (d50 in cm, Sa in cm)
+NANOVEA_DATA: dict[int, dict[str, float]] = {
+    60: {"d50": 0.0269, "sa": 0.0050},
+    80: {"d50": 0.0201, "sa": 0.0038},
+    120: {"d50": 0.0125, "sa": 0.0024},
+    180: {"d50": 0.0082, "sa": 0.0016},
+    240: {"d50": 0.0058, "sa": 0.0011},
+    320: {"d50": 0.0046, "sa": 0.0009},
 }
 
-# Log-log power-law interpolation for grit estimation
-_log_diams = np.log(NANOVEA_DATA["diam_um"])
-_log_grits = np.log(NANOVEA_DATA["grit"])
-_grit_interp_func = interp1d(_log_diams, _log_grits, kind="linear", fill_value="extrapolate")
+
+def nanovea_d50_from_grit(grit: float) -> float:
+    """Estimates mean grain diameter d50 (in cm) from P-grit value using empirical Nanovea lookup or power-law fit."""
+    int_grit = int(round(grit))
+    if int_grit in NANOVEA_DATA:
+        return NANOVEA_DATA[int_grit]["d50"]
+    return (4750.0 / (grit**0.85)) * 1e-4
 
 
-def estimate_grit(mean_diam_um: float) -> int:
-    """Calculates estimated grit rating from particle diameter using log-log interpolation."""
-    log_d = np.log(mean_diam_um)
-    return max(1, int(round(np.exp(_grit_interp_func(log_d)))))
+def estimate_grit(d50_cm: float) -> float:
+    """Estimates P-grit rating from grain diameter d50 (in cm)."""
+    for grit, data in NANOVEA_DATA.items():
+        if np.isclose(d50_cm, data["d50"], atol=1e-4):
+            return float(grit)
+    if d50_cm <= 0:
+        return 80.0
+    return float((0.475 / d50_cm) ** (1.0 / 0.85))
+
+
+@dataclass
+class Terrain:
+    """3D Incline terrain container with heightmaps, pre-calculated gradients, and spatial interpolation."""
+
+    x: np.ndarray
+    y: np.ndarray
+    z: np.ndarray
+    dz_dx: np.ndarray | None = None
+    dz_dy: np.ndarray | None = None
+    slope_angle: float = 10.0
+    p_value_rough: float = 80.0
+    p_value_smooth: float = 180.0
+
+    def __post_init__(self):
+        # Infer grid resolutions and bounding domains
+        if self.x.ndim == 2:
+            self.dx = float(abs(self.x[1, 0] - self.x[0, 0]))
+            self.dy = float(abs(self.y[0, 1] - self.y[0, 0]))
+            self.nx, self.ny = self.x.shape
+            self.x_bounds = (float(self.x.min()), float(self.x.max()))
+            self.y_bounds = (float(self.y.min()), float(self.y.max()))
+        else:
+            self.dx = float(abs(self.x[1] - self.x[0])) if len(self.x) > 1 else 0.02
+            self.dy = float(abs(self.y[1] - self.y[0])) if len(self.y) > 1 else 0.02
+            self.nx, self.ny = len(self.x), len(self.y)
+            self.x_bounds = (float(self.x[0]), float(self.x[-1]))
+            self.y_bounds = (float(self.y[0]), float(self.y[-1]))
+
+        # Compute CPU fallback surface gradients if missing
+        if self.dz_dx is None or self.dz_dy is None:
+            self.dz_dx, self.dz_dy = np.gradient(self.z, self.dx, self.dy)
+
+    def get_height(self, x_val: float, y_val: float) -> float:
+        """Bilinear interpolation for surface height Z at position (x_val, y_val)."""
+        gx = np.clip((x_val - self.x_bounds[0]) / self.dx, 0, self.nx - 2)
+        gy = np.clip((y_val - self.y_bounds[0]) / self.dy, 0, self.ny - 2)
+        ix, iy = int(gx), int(gy)
+        rx, ry = gx - ix, gy - iy
+
+        z00 = self.z[ix, iy]
+        z10 = self.z[ix + 1, iy]
+        z01 = self.z[ix, iy + 1]
+        z11 = self.z[ix + 1, iy + 1]
+
+        return float((1 - rx) * (1 - ry) * z00 + rx * (1 - ry) * z10 + (1 - rx) * ry * z01 + rx * ry * z11)
+
+    def get_gradient(self, x_val: float, y_val: float) -> tuple[float, float]:
+        """Bilinear interpolation for surface gradients (dz_dx, dz_dy) at position (x_val, y_val)."""
+        gx = np.clip((x_val - self.x_bounds[0]) / self.dx, 0, self.nx - 2)
+        gy = np.clip((y_val - self.y_bounds[0]) / self.dy, 0, self.ny - 2)
+        ix, iy = int(gx), int(gy)
+        rx, ry = gx - ix, gy - iy
+
+        dzdx_00 = self.dz_dx[ix, iy]
+        dzdx_10 = self.dz_dx[ix + 1, iy]
+        dzdx_01 = self.dz_dx[ix, iy + 1]
+        dzdx_11 = self.dz_dx[ix + 1, iy + 1]
+
+        dzdy_00 = self.dz_dy[ix, iy]
+        dzdy_10 = self.dz_dy[ix + 1, iy]
+        dzdy_01 = self.dz_dy[ix, iy + 1]
+        dzdy_11 = self.dz_dy[ix + 1, iy + 1]
+
+        dzdx = (1 - rx) * (1 - ry) * dzdx_00 + rx * (1 - ry) * dzdx_10 + (1 - rx) * ry * dzdx_01 + rx * ry * dzdx_11
+        dzdy = (1 - rx) * (1 - ry) * dzdy_00 + rx * (1 - ry) * dzdy_10 + (1 - rx) * ry * dzdy_01 + rx * ry * dzdy_11
+
+        return float(dzdx), float(dzdy)
+
+
+def generate_terrain_gpu(
+    x_min: float = 0.0,
+    x_max: float = 29.0,
+    y_min: float = 0.0,
+    y_max: float = 23.0,
+    dx: float = 0.02,
+    dy: float = 0.02,
+    slope_angle_deg: float = 10.0,
+    p_value_left: float = 80.0,
+    p_value_right: float = 180.0,
+    is_dual: bool = True,
+    device: str = "cuda",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Generates 3D terrain heightmap and gradients on GPU using PyTorch tensors."""
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    # 1. 2D Meshgrid on GPU
+    x_coords = torch.arange(x_min, x_max + dx, dx, device=dev, dtype=torch.float32)
+    y_coords = torch.arange(y_min, y_max + dy, dy, device=dev, dtype=torch.float32)
+    X, Y = torch.meshgrid(x_coords, y_coords, indexing="ij")
+
+    # 2. Base Incline Plane Z_base = -X * tan(theta)
+    theta = np.radians(slope_angle_deg)
+    Z_base = -X * float(np.tan(theta))
+
+    # 3. Dual-Grit Micro-Roughness Scale (d50 estimation in cm)
+    d50_left = nanovea_d50_from_grit(p_value_left)
+    d50_right = nanovea_d50_from_grit(p_value_right) if is_dual else d50_left
+
+    roughness_map = torch.where(Y < (y_max / 2.0), d50_left * 0.5, d50_right * 0.5)
+
+    # 4. Generate Random Noise and Smooth with Gaussian Kernel on GPU
+    noise = torch.randn_like(X) * roughness_map
+
+    kernel_size = 7
+    sigma = 1.2
+    k_1d = torch.exp(
+        -0.5 * (torch.arange(-kernel_size // 2 + 1, kernel_size // 2 + 1, device=dev).float() / sigma) ** 2
+    )
+    kernel_2d = torch.outer(k_1d, k_1d)
+    kernel_2d /= kernel_2d.sum()
+    kernel_2d = kernel_2d.view(1, 1, kernel_size, kernel_size)
+
+    # Fast GPU 2D Reflective Convolution
+    padded_noise = torch.nn.functional.pad(
+        noise.unsqueeze(0).unsqueeze(0), (kernel_size // 2,) * 4, mode="reflect"
+    )
+    z_rough = torch.nn.functional.conv2d(padded_noise, kernel_2d).squeeze()
+
+    Z = Z_base + z_rough
+
+    # 5. Partial Derivatives dZ/dX and dZ/dY via GPU Finite Differences
+    dZ_dX, dZ_dY = torch.gradient(Z, spacing=(dx, dy))
+
+    return (
+        X.cpu().numpy(),
+        Y.cpu().numpy(),
+        Z.cpu().numpy(),
+        dZ_dX.cpu().numpy(),
+        dZ_dY.cpu().numpy(),
+    )
+
+
+def generate_terrain(
+    x_min: float = 0.0,
+    x_max: float = 29.0,
+    y_min: float = 0.0,
+    y_max: float = 23.0,
+    dx: float = 0.02,
+    dy: float = 0.02,
+    slope_angle_deg: float = 10.0,
+    p_value_left: float = 80.0,
+    p_value_right: float = 180.0,
+    is_dual: bool = True,
+    use_gpu: bool = True,
+) -> Terrain:
+    """Convenience factory function returning a pre-populated Terrain instance."""
+    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    X, Y, Z, dz_dx, dz_dy = generate_terrain_gpu(
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        dx=dx,
+        dy=dy,
+        slope_angle_deg=slope_angle_deg,
+        p_value_left=p_value_left,
+        p_value_right=p_value_right,
+        is_dual=is_dual,
+        device=device,
+    )
+    return Terrain(
+        x=X,
+        y=Y,
+        z=Z,
+        dz_dx=dz_dx,
+        dz_dy=dz_dy,
+        slope_angle=slope_angle_deg,
+        p_value_rough=p_value_left,
+        p_value_smooth=p_value_right,
+    )
 
 
 def generate_calibrated_sandpaper(
-    target_diam_um: float = 127.0,
-    target_Sa_um: float = 42.37,
-    patch_size_cm: float | None = 0.20,
-    x_range: tuple[float, float] | None = None,
-    y_range: tuple[float, float] | None = None,
-    incline_deg: float = 30.0,
-    grid_res: int | tuple[int, int] = 500,
-    tile_size_cm: float = 0.20,
-    seed: int | None = None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    float,
-    float,
-    float,
-    int,
-]:
-    """Evaluates micro-grit surface topography in localized spatial tiles to keep the memory footprint
-    constant regardless of total surface area.
-    """
-    rng = np.random.default_rng(seed)
-
-    if x_range is None or y_range is None:
-        p_size = patch_size_cm if patch_size_cm is not None else 0.20
-        x_range = (0.0, p_size)
-        y_range = (0.0, p_size)
-
-    if isinstance(grid_res, int):
-        nx, ny = grid_res, grid_res
-    else:
-        nx, ny = grid_res
-
-    x_min, x_max = x_range
-    y_min, y_max = y_range
-    width_cm = x_max - x_min
-    height_cm = y_max - y_min
-
-    r_mean_cm = (target_diam_um / 2.0) / 10000.0
-    r_std_cm = r_mean_cm * 0.15
-    spacing = r_mean_cm * 1.35
-    pad = r_mean_cm * 3.0
-    z_aspect = 1.30
-
-    x_coords = np.linspace(x_min, x_max, nx)
-    y_coords = np.linspace(y_min, y_max, ny)
-    X_m, Y_m = np.meshgrid(x_coords, y_coords, indexing="ij")
-    z_local = np.zeros((nx, ny), dtype=np.float64)
-
-    # Divide global grid into tiles
-    x_tiles = np.arange(x_min, x_max, tile_size_cm)
-    y_tiles = np.arange(y_min, y_max, tile_size_cm)
-
-    for i, tx_start in enumerate(x_tiles):
-        tx_end = min(tx_start + tile_size_cm, x_max)
-        if i == len(x_tiles) - 1:
-            ix = np.where((x_coords >= tx_start) & (x_coords <= tx_end))[0]
-        else:
-            ix = np.where((x_coords >= tx_start) & (x_coords < tx_end))[0]
-
-        if len(ix) == 0:
-            continue
-
-        for j, ty_start in enumerate(y_tiles):
-            ty_end = min(ty_start + tile_size_cm, y_max)
-            if j == len(y_tiles) - 1:
-                iy = np.where((y_coords >= ty_start) & (y_coords <= ty_end))[0]
-            else:
-                iy = np.where((y_coords >= ty_start) & (y_coords < ty_end))[0]
-
-            if len(iy) == 0:
-                continue
-
-            sub_X = X_m[np.ix_(ix, iy)]
-            sub_Y = Y_m[np.ix_(ix, iy)]
-            tile_pts = np.column_stack([sub_X.ravel(), sub_Y.ravel()])
-
-            # Local seed placement strictly within tile boundaries + padding
-            gx = np.arange(tx_start - pad, tx_end + pad, spacing)
-            gy = np.arange(ty_start - pad, ty_end + pad, spacing)
-            GX, GY = np.meshgrid(gx, gy)
-
-            jitter = spacing * 0.40
-            cx = (GX + rng.uniform(-jitter, jitter, size=GX.shape)).ravel()
-            cy = (GY + rng.uniform(-jitter, jitter, size=GY.shape)).ravel()
-
-            n_grains = len(cx)
-            r_grains = np.clip(
-                rng.normal(r_mean_cm, r_std_cm, size=n_grains),
-                r_mean_cm * 0.5,
-                r_mean_cm * 1.5,
-            )
-            z_offsets = rng.normal(0.0, r_mean_cm * 0.40, size=n_grains)
-
-            # Localized cKDTree query
-            tree = cKDTree(np.column_stack([cx, cy]))
-            dists, indices = tree.query(tile_pts, k=4)
-
-            z_flat = np.full(len(tile_pts), -1e5, dtype=np.float64)
-            for k in range(4):
-                d_k = dists[:, k]
-                idx_k = indices[:, k]
-                r_k = r_grains[idx_k]
-                z_off_k = z_offsets[idx_k]
-                diff_k = np.maximum(0.0, r_k**2 - d_k**2)
-                z_k = z_off_k + z_aspect * np.sqrt(diff_k)
-                np.maximum(z_flat, z_k, out=z_flat)
-
-            z_tile = z_flat.reshape((len(ix), len(iy)))
-            z_tile = np.maximum(z_tile, -r_mean_cm * 0.10)
-            z_local[np.ix_(ix, iy)] = z_tile
-
-    z_local -= z_local.min()
-
-    # Sa Precision Calibration across the stitched domain
-    current_Sa = float(np.mean(np.abs(z_local - np.mean(z_local))) * 10000.0)
-    if current_Sa > 0:
-        z_local *= target_Sa_um / current_Sa
-
-    Sa_um = float(np.mean(np.abs(z_local - np.mean(z_local))) * 10000.0)
-    grit_val = estimate_grit(target_diam_um)
-
-    # 3D Rigid Rotation
-    theta = np.radians(incline_deg)
-    X_3d = X_m
-    Y_3d = Y_m * np.cos(theta) - z_local * np.sin(theta)
-    Z_3d = Y_m * np.sin(theta) + z_local * np.cos(theta)
-
-    return (
-        X_m,
-        Y_m,
-        z_local,
-        X_3d,
-        Y_3d,
-        Z_3d,
-        max(width_cm, height_cm),
-        Sa_um,
-        target_diam_um,
-        grit_val,
+    x_min: float = 0.0,
+    x_max: float = 29.0,
+    y_min: float = 0.0,
+    y_max: float = 23.0,
+    dx: float = 0.02,
+    dy: float = 0.02,
+    slope_angle_deg: float = 10.0,
+    p_value_left: float = 80.0,
+    p_value_right: float = 180.0,
+    is_dual: bool = True,
+    use_gpu: bool = True,
+) -> Terrain:
+    """Alias function maintained for backwards compatibility with plotting scripts."""
+    return generate_terrain(
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        dx=dx,
+        dy=dy,
+        slope_angle_deg=slope_angle_deg,
+        p_value_left=p_value_left,
+        p_value_right=p_value_right,
+        is_dual=is_dual,
+        use_gpu=use_gpu,
     )
-
-
-def p_value_to_d50_cm(p_value: float) -> float:
-    """Converts FEPA P-value to average particle diameter d50 (in cm) using ISO 6344 standard fit."""
-    if p_value <= 0:
-        return 0.02
-    d50_um = 12500.0 / (float(p_value) ** 0.95)
-    return d50_um / 10000.0
-
-
-def d50_cm_to_p_value(d50_cm: float) -> float:
-    """Converts average particle diameter d50 (in cm) to FEPA P-value."""
-    d50_um = float(d50_cm) * 10000.0
-    if d50_um <= 0:
-        return float("inf")
-    return float((12500.0 / d50_um) ** (1.0 / 0.95))
-
-
-class Terrain:
-    def __init__(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        z: np.ndarray,
-        p_value_mean: float = 0.0,
-        p_value_rough: float = 0.0,
-        p_value_smooth: float = 0.0,
-    ):
-        self.x = x
-        self.y = y
-        self.z = z
-
-        self.p_value_mean = p_value_mean
-        self.p_value_rough = p_value_rough
-        self.p_value_smooth = p_value_smooth
-
-        self.X, self.Y = np.meshgrid(x, y, indexing="ij")
-        self.Z = z
-
-        self.x_bounds = (float(x[0]), float(x[-1]))
-        self.y_bounds = (float(y[0]), float(y[-1]))
-
-        self.dx = float(x[1] - x[0])
-        self.dy = float(y[1] - y[0])
-        self.nx = len(x)
-        self.ny = len(y)
-
-        dz_dx, dz_dy = np.gradient(z, self.dx, self.dy)
-        self.dz_dx = dz_dx
-        self.dz_dy = dz_dy
-
-        self.slope_angle = 30.0
-
-    def _bilinear_interp(
-        self, grid: np.ndarray, x: float | np.ndarray, y: float | np.ndarray
-    ) -> float | np.ndarray:
-        """Fast O(1) uniform bilinear interpolation."""
-        is_scalar = np.isscalar(x) and np.isscalar(y)
-        x_arr = np.atleast_1d(x)
-        y_arr = np.atleast_1d(y)
-
-        gx = (x_arr - self.x_bounds[0]) / self.dx
-        gy = (y_arr - self.y_bounds[0]) / self.dy
-
-        ix = np.clip(np.floor(gx).astype(int), 0, self.nx - 2)
-        iy = np.clip(np.floor(gy).astype(int), 0, self.ny - 2)
-
-        rx = np.clip(gx - ix, 0.0, 1.0)
-        ry = np.clip(gy - iy, 0.0, 1.0)
-
-        f00 = grid[ix, iy]
-        f10 = grid[ix + 1, iy]
-        f01 = grid[ix, iy + 1]
-        f11 = grid[ix + 1, iy + 1]
-
-        res = (1.0 - rx) * (1.0 - ry) * f00 + rx * (1.0 - ry) * f10 + (1.0 - rx) * ry * f01 + rx * ry * f11
-        return float(res[0]) if is_scalar else res
-
-    def get_elevation(self, x: float | np.ndarray, y: float | np.ndarray) -> float | np.ndarray:
-        return self._bilinear_interp(self.z, x, y)
-
-    def get_height(self, x: float | np.ndarray, y: float | np.ndarray) -> float | np.ndarray:
-        return self.get_elevation(x, y)
-
-    def get_normal(self, x: float | np.ndarray, y: float | np.ndarray) -> np.ndarray:
-        zx = self._bilinear_interp(self.dz_dx, x, y)
-        zy = self._bilinear_interp(self.dz_dy, x, y)
-
-        if np.isscalar(zx):
-            norm = np.sqrt(zx * zx + zy * zy + 1.0)
-            return np.array([-zx / norm, -zy / norm, 1.0 / norm], dtype=np.float64)
-
-        normals = np.column_stack([-zx, -zy, np.ones_like(zx)])
-        norms = np.linalg.norm(normals, axis=1, keepdims=True)
-        return normals / np.maximum(norms, 1e-12)
-
-
-def generate_terrain(config: TerrainConfig) -> Terrain:
-    """Generates an inclined sandpaper surface using tiled KDTree micro-geometry
-    calibrated directly via generate_calibrated_sandpaper.
-    """
-    diam_rough_um = max(config.roughness_amplitude_rough * 10000.0, 1.0)
-    diam_smooth_um = max(config.roughness_amplitude_smooth * 10000.0, 1.0)
-
-    sa_rough_um = diam_rough_um * 0.33
-    sa_smooth_um = diam_smooth_um * 0.33
-
-    seed_rough = config.seed
-    seed_smooth = (config.seed + 1000) if config.seed is not None else None
-
-    # Tiled evaluation across rough and smooth domains
-    X_m, Y_m, z_rough, _, _, _, _, _, _, grit_rough = generate_calibrated_sandpaper(
-        target_diam_um=diam_rough_um,
-        target_Sa_um=sa_rough_um,
-        x_range=config.x_range,
-        y_range=config.y_range,
-        grid_res=config.resolution,
-        tile_size_cm=0.20,
-        incline_deg=0.0,
-        seed=seed_rough,
-    )
-
-    _, _, z_smooth, _, _, _, _, _, _, grit_smooth = generate_calibrated_sandpaper(
-        target_diam_um=diam_smooth_um,
-        target_Sa_um=sa_smooth_um,
-        x_range=config.x_range,
-        y_range=config.y_range,
-        grid_res=config.resolution,
-        tile_size_cm=0.20,
-        incline_deg=0.0,
-        seed=seed_smooth,
-    )
-
-    # Sigmoidal transition blending
-    weights = 1.0 / (1.0 + np.exp((Y_m - config.roughness_transition_y) / 0.15))
-    z_micro = weights * z_rough + (1.0 - weights) * z_smooth
-
-    # Macro incline slope
-    z_incline = -X_m * np.tan(np.radians(config.slope_angle))
-    z = z_incline + z_micro
-
-    x_vec = X_m[:, 0]
-    y_vec = Y_m[0, :]
-
-    terrain = Terrain(
-        x=x_vec,
-        y=y_vec,
-        z=z,
-        p_value_mean=estimate_grit((diam_rough_um + diam_smooth_um) / 2.0),
-        p_value_rough=grit_rough,
-        p_value_smooth=grit_smooth,
-    )
-    terrain.slope_angle = config.slope_angle
-    return terrain

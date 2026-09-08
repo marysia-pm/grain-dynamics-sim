@@ -17,6 +17,7 @@ from rough_slope_sim.terrain import (
     estimate_grit,
     generate_calibrated_sandpaper,
     generate_terrain,
+    generate_terrain_gpu,
 )
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "EnsembleConfig",
     "Terrain",
     "generate_terrain",
+    "generate_terrain_gpu",
     "generate_calibrated_sandpaper",
     "estimate_grit",
     "NANOVEA_DATA",
