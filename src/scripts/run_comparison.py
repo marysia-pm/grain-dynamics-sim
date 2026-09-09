@@ -1,4 +1,4 @@
-"""Complete runner script with centralized angle configuration and dynamic terrain projection."""
+"""Complete runner script with calibrated grit amplitude scaling and X-axis track zero-alignment."""
 
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from rough_slope_sim import (
 from rough_slope_sim.analysis import (
     calculate_diffusion_coefficient,
     compare_distributions,
-    particle_size_from_grit,
     trajectories_at_x_slice,
 )
 from rough_slope_sim.plotting import (
@@ -35,13 +34,11 @@ from rough_slope_sim.plotting import (
     plot_trajectories_3d,
     plot_trajectories_and_three_slices,
 )
+from rough_slope_sim.terrain import nanovea_d50_from_grit
 
-# 1 px = 0.01185 cm. This is a fixed calibration constant for the camera setup
-# used to record experiments; it is NOT a general unit-detection mechanism.
 PX_TO_CM = 0.01185
-
 X_SLICES = [5.0, 10.0, 15.0]
-CLOSEUP_X, CLOSEUP_Y = 5.0, 15.0  # where to render the ball/surface close-up
+CLOSEUP_X, CLOSEUP_Y = 5.0, 15.0
 
 
 @dataclass
@@ -54,13 +51,11 @@ class SurfaceConfig:
 
 
 def grit_to_amplitude(grit: float) -> float:
-    """Converts grit (P-value) to peak-to-trough surface amplitude (particle diameter in cm)."""
-    p_size_um = particle_size_from_grit(grit)
-    return float(p_size_um / 10000.0)
+    """Converts grit (P-value) to grain amplitude d50 (in cm) via Nanovea profilometer lookup."""
+    return nanovea_d50_from_grit(grit)
 
 
 def parse_folder(folder_name: str, y_mid: float = 11.5) -> SurfaceConfig:
-    """Parses folder naming conventions to identify surface grit parameters and layout."""
     dual_match = re.search(r"(\d+)[\\/](\d+)P_(mid|tilted(\d*))", folder_name, re.IGNORECASE)
     if dual_match:
         g_l, g_r = float(dual_match.group(1)), float(dual_match.group(2))
@@ -82,14 +77,6 @@ def parse_folder(folder_name: str, y_mid: float = 11.5) -> SurfaceConfig:
 
 
 def _guess_scale(max_v: float) -> float:
-    """Heuristic unit guess based on the magnitude of raw track coordinates.
-
-    NOTE: this is a magnitude threshold, not a real unit check -- it assumes
-    trajectories always span roughly the same physical range. If a future
-    dataset has a different camera FOV or ramp size, these thresholds (290,
-    29) may misclassify units silently. Worth replacing with an explicit
-    per-folder unit tag if this ever bites you.
-    """
     if max_v > 290.0:
         return PX_TO_CM
     if max_v > 29.0:
@@ -97,8 +84,8 @@ def _guess_scale(max_v: float) -> float:
     return 1.0
 
 
-def load_trajectories(folder: Path, ramp_length_proj_cm: float) -> list[np.ndarray]:
-    """Loads experimental trajectories and aligns release point to X ~ 0 cm."""
+def load_trajectories(folder: Path, ramp_length_proj_cm: float, target_x0: float = 0.1) -> list[np.ndarray]:
+    """Loads experimental trajectories, fixes orientation, and aligns release points to target_x0."""
     trajs = []
     column_renames = {"particle": "ball_id", "track_id": "ball_id", "pos_x": "x", "pos_y": "y"}
 
@@ -133,6 +120,11 @@ def load_trajectories(folder: Path, ramp_length_proj_cm: float) -> list[np.ndarr
         for t in trajs:
             t[:, 1] = ramp_length_proj_cm - t[:, 1]
 
+    # Align experimental tracks along X so every trajectory release point starts at target_x0
+    for t in trajs:
+        x_start = t[0, 1]
+        t[:, 1] = t[:, 1] - x_start + target_x0
+
     return trajs
 
 
@@ -143,7 +135,6 @@ def sample_hybrid_y0(
     seed: int = 42,
     blend_factor: float = 0.5,
 ) -> np.ndarray:
-    """Samples Y0 using a hybrid distribution (50% Uniform + 50% Truncated Gaussian)."""
     rng = np.random.default_rng(seed)
 
     u_samples = rng.uniform(y_min, y_max, size=num_samples)
@@ -163,8 +154,6 @@ def process_folder(
     ramp_length_cm: float,
     x_max_proj: float,
 ) -> dict | None:
-    """Runs the full experiment-vs-simulation comparison for one folder. Returns a
-    summary record dict, or None if the folder had no usable trajectories."""
     folder_name = exp_folder.name
     cfg = parse_folder(folder_name)
 
@@ -180,7 +169,9 @@ def process_folder(
     sub_out = out_root / folder_name.replace("\\", "_").replace("/", "_")
     sub_out.mkdir(parents=True, exist_ok=True)
 
-    exp_trajs = [t for t in load_trajectories(exp_folder, ramp_length_proj_cm=x_max_proj) if len(t) > 0]
+    exp_trajs = [
+        t for t in load_trajectories(exp_folder, ramp_length_proj_cm=x_max_proj, target_x0=0.1) if len(t) > 0
+    ]
     if not exp_trajs:
         tqdm.write("  └── [!] No valid trajectories found. Skipping.")
         return None
@@ -192,16 +183,19 @@ def process_folder(
     sim_y0_vals = sample_hybrid_y0(y_min, y_max, num_samples=num_sim_balls)
     sampled_initial_states = [(0.1, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
 
-    tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories")
+    tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories (X release aligned to 0.1 cm)")
     tqdm.write(
         f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0 | Hybrid Y0 in [{y_min:.2f}, {y_max:.2f}] cm"
     )
 
+    # Construct TerrainConfig passing explicit grit values along with amplitudes
     t_cfg = TerrainConfig(
         ramp_length=ramp_length_cm,
         slope_angle=slope_angle_deg,
         roughness_amplitude_rough=grit_to_amplitude(cfg.grit_left),
         roughness_amplitude_smooth=grit_to_amplitude(cfg.grit_right),
+        grit_rough=cfg.grit_left,
+        grit_smooth=cfg.grit_right,
         roughness_transition_y=11.5,
         seed=42,
     )
@@ -211,8 +205,8 @@ def process_folder(
     tqdm.write(f"  ├── Smooth side    : {terrain.p_value_smooth:.0f}P")
     tqdm.write(f"  ├── Overall surface: {terrain.p_value_mean:.0f}P")
 
-    ball_cfg = BallConfig(radius=0.125)
-    physics_cfg = PhysicsConfig(slope_angle=slope_angle_deg)
+    ball_cfg = BallConfig(radius=0.125, x0=0.1)
+    physics_cfg = PhysicsConfig(gravity=981.0, slope_angle=slope_angle_deg)
     e_cfg = EnsembleConfig(k_max=num_sim_balls, seed=42)
 
     sim_trajs = run_ensemble_parallel(

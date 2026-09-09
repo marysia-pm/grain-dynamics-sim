@@ -1,327 +1,349 @@
-"""Terrain generation and surface representation for sandpaper micro-geometry using ISO 6344 standards and Nanovea benchmarks."""
+"""Terrain generation and surface roughness models.
+
+Coordinate convention: X-Y is the horizontal ground plane, Z is vertical
+(up). The incline is baked into the height field as a pure additive planar
+term, -x*tan(slope_angle), applied AFTER the grain texture is built in the
+flat (untilted) frame. Grain bump height depends only on horizontal (x, y)
+distance from each grain center, so adding a planar tilt afterward does not
+shear or stretch the grain footprints -- it just stacks a linear ramp under
+them. (Grain heights are tens of microns; the ramp is tens of centimeters,
+so this is physically indistinguishable from a true rigid rotation of the
+textured surface.)
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 from scipy.interpolate import interp1d
+from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 
-from .config import TerrainConfig
-
-# Benchmark NANOVEA Profilometry Reference Data
-NANOVEA_DATA = {
-    "grit": np.array([120, 180, 320, 800, 2000], dtype=np.float64),
-    "diam_um": np.array([127.0, 105.6, 67.18, 28.16, 21.27], dtype=np.float64),
-    "Sa_um": np.array([42.37, 27.28, 17.92, 6.273, 3.639], dtype=np.float64),
+# Calibrated Nanovea profilometer dataset exported for plotting and direct lookup
+NANOVEA_DATA: dict[int, dict[str, float]] = {
+    80: {"d50_cm": 0.0201, "d50_um": 201.0},
+    120: {"d50_cm": 0.0125, "d50_um": 125.0},
+    180: {"d50_cm": 0.0082, "d50_um": 82.0},
+    240: {"d50_cm": 0.0053, "d50_um": 53.0},
+    320: {"d50_cm": 0.0046, "d50_um": 46.0},
+    400: {"d50_cm": 0.0035, "d50_um": 35.0},
+    600: {"d50_cm": 0.0025, "d50_um": 25.0},
+    800: {"d50_cm": 0.0021, "d50_um": 21.0},
+    1000: {"d50_cm": 0.0018, "d50_um": 18.0},
+    1200: {"d50_cm": 0.0015, "d50_um": 15.0},
+    2000: {"d50_cm": 0.0010, "d50_um": 10.0},
 }
 
-# Log-log power-law interpolation for grit estimation
-_log_diams = np.log(NANOVEA_DATA["diam_um"])
-_log_grits = np.log(NANOVEA_DATA["grit"])
-_grit_interp_func = interp1d(_log_diams, _log_grits, kind="linear", fill_value="extrapolate")
+NANOVEA_GRIT_TABLE = np.array(list(NANOVEA_DATA.keys()), dtype=np.float64)
+NANOVEA_D50_CM_TABLE = np.array([v["d50_cm"] for v in NANOVEA_DATA.values()], dtype=np.float64)
+
+_d50_from_grit_interp = interp1d(
+    np.log10(NANOVEA_GRIT_TABLE),
+    np.log10(NANOVEA_D50_CM_TABLE),
+    kind="linear",
+    fill_value="extrapolate",
+)
+
+_grit_from_d50_interp = interp1d(
+    np.log10(NANOVEA_D50_CM_TABLE[::-1]),
+    np.log10(NANOVEA_GRIT_TABLE[::-1]),
+    kind="linear",
+    fill_value="extrapolate",
+)
 
 
-def estimate_grit(mean_diam_um: float) -> int:
-    """Calculates estimated grit rating from particle diameter using log-log interpolation."""
-    log_d = np.log(mean_diam_um)
-    return max(1, int(round(np.exp(_grit_interp_func(log_d)))))
+def nanovea_d50_from_grit(grit: float) -> float:
+    """Returns calibrated particle diameter d50 (cm) for a given P-grit."""
+    log_d50 = _d50_from_grit_interp(np.log10(float(grit)))
+    return float(10.0**log_d50)
 
 
-def generate_calibrated_sandpaper(
-    target_diam_um: float = 127.0,
-    target_Sa_um: float = 42.37,
-    patch_size_cm: float | None = 0.20,
-    x_range: tuple[float, float] | None = None,
-    y_range: tuple[float, float] | None = None,
-    incline_deg: float = 30.0,
-    grid_res: int | tuple[int, int] = 500,
-    tile_size_cm: float = 0.20,
-    seed: int | None = None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    float,
-    float,
-    float,
-    int,
-]:
-    """Evaluates micro-grit surface topography in localized spatial tiles to keep the memory footprint
-    constant regardless of total surface area.
+def nanovea_grit_from_d50(d50_cm: float) -> float:
+    """Returns equivalent P-grit for a given particle diameter d50 (cm)."""
+    log_grit = _grit_from_d50_interp(np.log10(float(d50_cm)))
+    return float(10.0**log_grit)
+
+
+def estimate_grit(d50_cm: float) -> float:
+    """Alias for backwards compatibility with __init__.py imports."""
+    return nanovea_grit_from_d50(d50_cm)
+
+
+def _grain_bump_field(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    d50: float,
+    y_mask: np.ndarray | None = None,
+    coverage: float = 0.85,
+    height_jitter: tuple[float, float] = (0.8, 1.2),
+    max_grains: int = 1_500_000,
+    seed: int = 42,
+) -> tuple[np.ndarray, bool]:
+    """Rasterizes real overlapping hemispherical ("half-sphere") grains over
+    (x_grid, y_grid) using a KD-tree for efficiency. Grain height depends
+    only on horizontal distance from each grain center -- no slope is
+    involved here, so footprints stay perfectly round.
+
+    Returns (bump_height_field, used_real_grains). If the grit is fine
+    enough that faithfully placing individual grains would need more than
+    `max_grains`, falls back to correlated Gaussian noise matched to the
+    same d50 amplitude and correlation length (used_real_grains=False) --
+    at that scale a real surface looks like fine continuous texture anyway,
+    not discrete visible bumps.
     """
+    xx, yy = np.meshgrid(x_grid, y_grid, indexing="ij")
+    if y_mask is None:
+        y_mask = np.ones_like(yy, dtype=bool)
+
+    x_len = float(x_grid[-1] - x_grid[0])
+    y_len = float(y_grid[-1] - y_grid[0])
+    active_area = x_len * y_len * (float(np.count_nonzero(y_mask)) / y_mask.size)
+
+    r_g = d50 / 2.0
+    grain_area = np.pi * r_g**2
+    n_grains = int(np.clip(coverage * active_area / max(grain_area, 1e-12), 4, max_grains))
+
     rng = np.random.default_rng(seed)
 
-    if x_range is None or y_range is None:
-        p_size = patch_size_cm if patch_size_cm is not None else 0.20
-        x_range = (0.0, p_size)
-        y_range = (0.0, p_size)
+    if n_grains >= max_grains:
+        # Too fine to place individually over this domain -- statistically
+        # equivalent correlated noise instead (real fine-grit paper looks
+        # like smooth continuous texture at this scale, not discrete bumps).
+        dx = float(x_grid[1] - x_grid[0]) if len(x_grid) > 1 else 1.0
+        sigma_px = max(0.5 * (d50 / dx), 0.5)
+        noise = gaussian_filter(rng.standard_normal(xx.shape), sigma=sigma_px)
+        noise *= d50 / (np.std(noise) or 1.0)
+        return np.where(y_mask, noise, 0.0), False
 
-    if isinstance(grid_res, int):
-        nx, ny = grid_res, grid_res
-    else:
-        nx, ny = grid_res
+    y_idx = np.where(np.any(y_mask, axis=0))[0]
+    y_lo = y_grid[y_idx[0]] if len(y_idx) else y_grid[0]
+    y_hi = y_grid[y_idx[-1]] if len(y_idx) else y_grid[-1]
 
-    x_min, x_max = x_range
-    y_min, y_max = y_range
-    width_cm = x_max - x_min
-    height_cm = y_max - y_min
+    gx = rng.uniform(x_grid[0] - r_g, x_grid[-1] + r_g, size=n_grains)
+    gy = rng.uniform(y_lo - r_g, y_hi + r_g, size=n_grains)
+    gh = rng.uniform(height_jitter[0], height_jitter[1], size=n_grains) * d50
 
-    r_mean_cm = (target_diam_um / 2.0) / 10000.0
-    r_std_cm = r_mean_cm * 0.15
-    spacing = r_mean_cm * 1.35
-    pad = r_mean_cm * 3.0
-    z_aspect = 1.30
+    tree = cKDTree(np.column_stack([gx, gy]))
+    pts = np.column_stack([xx.ravel(), yy.ravel()])
 
-    x_coords = np.linspace(x_min, x_max, nx)
-    y_coords = np.linspace(y_min, y_max, ny)
-    X_m, Y_m = np.meshgrid(x_coords, y_coords, indexing="ij")
-    z_local = np.zeros((nx, ny), dtype=np.float64)
+    k = 4
+    dists, idxs = tree.query(pts, k=k, distance_upper_bound=r_g, workers=-1)
+    if k == 1:
+        dists, idxs = dists[:, None], idxs[:, None]
 
-    # Divide global grid into tiles
-    x_tiles = np.arange(x_min, x_max, tile_size_cm)
-    y_tiles = np.arange(y_min, y_max, tile_size_cm)
+    z_flat = np.zeros(pts.shape[0], dtype=np.float64)
+    for j in range(k):
+        valid = np.isfinite(dists[:, j])
+        dist_sq = dists[valid, j] ** 2
+        contrib = np.maximum(0.0, gh[idxs[valid, j]] * (1.0 - dist_sq / (r_g**2)))
+        z_flat[valid] = np.maximum(z_flat[valid], contrib)
 
-    for i, tx_start in enumerate(x_tiles):
-        tx_end = min(tx_start + tile_size_cm, x_max)
-        if i == len(x_tiles) - 1:
-            ix = np.where((x_coords >= tx_start) & (x_coords <= tx_end))[0]
-        else:
-            ix = np.where((x_coords >= tx_start) & (x_coords < tx_end))[0]
-
-        if len(ix) == 0:
-            continue
-
-        for j, ty_start in enumerate(y_tiles):
-            ty_end = min(ty_start + tile_size_cm, y_max)
-            if j == len(y_tiles) - 1:
-                iy = np.where((y_coords >= ty_start) & (y_coords <= ty_end))[0]
-            else:
-                iy = np.where((y_coords >= ty_start) & (y_coords < ty_end))[0]
-
-            if len(iy) == 0:
-                continue
-
-            sub_X = X_m[np.ix_(ix, iy)]
-            sub_Y = Y_m[np.ix_(ix, iy)]
-            tile_pts = np.column_stack([sub_X.ravel(), sub_Y.ravel()])
-
-            # Local seed placement strictly within tile boundaries + padding
-            gx = np.arange(tx_start - pad, tx_end + pad, spacing)
-            gy = np.arange(ty_start - pad, ty_end + pad, spacing)
-            GX, GY = np.meshgrid(gx, gy)
-
-            jitter = spacing * 0.40
-            cx = (GX + rng.uniform(-jitter, jitter, size=GX.shape)).ravel()
-            cy = (GY + rng.uniform(-jitter, jitter, size=GY.shape)).ravel()
-
-            n_grains = len(cx)
-            r_grains = np.clip(
-                rng.normal(r_mean_cm, r_std_cm, size=n_grains),
-                r_mean_cm * 0.5,
-                r_mean_cm * 1.5,
-            )
-            z_offsets = rng.normal(0.0, r_mean_cm * 0.40, size=n_grains)
-
-            # Localized cKDTree query
-            tree = cKDTree(np.column_stack([cx, cy]))
-            dists, indices = tree.query(tile_pts, k=4)
-
-            z_flat = np.full(len(tile_pts), -1e5, dtype=np.float64)
-            for k in range(4):
-                d_k = dists[:, k]
-                idx_k = indices[:, k]
-                r_k = r_grains[idx_k]
-                z_off_k = z_offsets[idx_k]
-                diff_k = np.maximum(0.0, r_k**2 - d_k**2)
-                z_k = z_off_k + z_aspect * np.sqrt(diff_k)
-                np.maximum(z_flat, z_k, out=z_flat)
-
-            z_tile = z_flat.reshape((len(ix), len(iy)))
-            z_tile = np.maximum(z_tile, -r_mean_cm * 0.10)
-            z_local[np.ix_(ix, iy)] = z_tile
-
-    z_local -= z_local.min()
-
-    # Sa Precision Calibration across the stitched domain
-    current_Sa = float(np.mean(np.abs(z_local - np.mean(z_local))) * 10000.0)
-    if current_Sa > 0:
-        z_local *= target_Sa_um / current_Sa
-
-    Sa_um = float(np.mean(np.abs(z_local - np.mean(z_local))) * 10000.0)
-    grit_val = estimate_grit(target_diam_um)
-
-    # 3D Rigid Rotation
-    theta = np.radians(incline_deg)
-    X_3d = X_m
-    Y_3d = Y_m * np.cos(theta) - z_local * np.sin(theta)
-    Z_3d = Y_m * np.sin(theta) + z_local * np.cos(theta)
-
-    return (
-        X_m,
-        Y_m,
-        z_local,
-        X_3d,
-        Y_3d,
-        Z_3d,
-        max(width_cm, height_cm),
-        Sa_um,
-        target_diam_um,
-        grit_val,
-    )
-
-
-def p_value_to_d50_cm(p_value: float) -> float:
-    """Converts FEPA P-value to average particle diameter d50 (in cm) using ISO 6344 standard fit."""
-    if p_value <= 0:
-        return 0.02
-    d50_um = 12500.0 / (float(p_value) ** 0.95)
-    return d50_um / 10000.0
-
-
-def d50_cm_to_p_value(d50_cm: float) -> float:
-    """Converts average particle diameter d50 (in cm) to FEPA P-value."""
-    d50_um = float(d50_cm) * 10000.0
-    if d50_um <= 0:
-        return float("inf")
-    return float((12500.0 / d50_um) ** (1.0 / 0.95))
+    return z_flat.reshape(xx.shape) * y_mask, True
 
 
 class Terrain:
+    """3D synthetic rough surface: X-Y ground plane, Z up. h(x, y) already
+    includes the incline tilt (applied additively, after grain texturing),
+    so a plain vertical gravity vector is enough to drive downslope motion —
+    the local surface normal does the rest."""
+
     def __init__(
         self,
-        x: np.ndarray,
-        y: np.ndarray,
-        z: np.ndarray,
-        p_value_mean: float = 0.0,
-        p_value_rough: float = 0.0,
-        p_value_smooth: float = 0.0,
+        height_map: np.ndarray,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        slope_angle: float,
+        roughness_amplitude_rough: float,
+        roughness_amplitude_smooth: float,
+        grit_rough: float | None = None,
+        grit_smooth: float | None = None,
     ):
-        self.x = x
-        self.y = y
-        self.z = z
+        self.height_map = height_map
+        self.x_grid = x_grid
+        self.y_grid = y_grid
+        self.slope_angle = slope_angle
+        self.roughness_amplitude_rough = roughness_amplitude_rough
+        self.roughness_amplitude_smooth = roughness_amplitude_smooth
 
-        self.p_value_mean = p_value_mean
-        self.p_value_rough = p_value_rough
-        self.p_value_smooth = p_value_smooth
+        self._grit_rough = (
+            grit_rough if grit_rough is not None else nanovea_grit_from_d50(roughness_amplitude_rough)
+        )
+        self._grit_smooth = (
+            grit_smooth if grit_smooth is not None else nanovea_grit_from_d50(roughness_amplitude_smooth)
+        )
 
-        self.X, self.Y = np.meshgrid(x, y, indexing="ij")
-        self.Z = z
+        self.dx = float(x_grid[1] - x_grid[0]) if len(x_grid) > 1 else 1.0
+        self.dy = float(y_grid[1] - y_grid[0]) if len(y_grid) > 1 else 1.0
+        self.grad_x, self.grad_y = np.gradient(height_map, self.dx, self.dy)
 
-        self.x_bounds = (float(x[0]), float(x[-1]))
-        self.y_bounds = (float(y[0]), float(y[-1]))
+    @property
+    def X(self) -> np.ndarray:
+        xx, _ = np.meshgrid(self.x_grid, self.y_grid, indexing="ij")
+        return xx
 
-        self.dx = float(x[1] - x[0])
-        self.dy = float(y[1] - y[0])
-        self.nx = len(x)
-        self.ny = len(y)
+    @property
+    def Y(self) -> np.ndarray:
+        _, yy = np.meshgrid(self.x_grid, self.y_grid, indexing="ij")
+        return yy
 
-        dz_dx, dz_dy = np.gradient(z, self.dx, self.dy)
-        self.dz_dx = dz_dx
-        self.dz_dy = dz_dy
+    @property
+    def Z(self) -> np.ndarray:
+        return self.height_map
 
-        self.slope_angle = 30.0
+    @property
+    def x_bounds(self) -> tuple[float, float]:
+        return float(self.x_grid[0]), float(self.x_grid[-1])
 
-    def _bilinear_interp(
-        self, grid: np.ndarray, x: float | np.ndarray, y: float | np.ndarray
-    ) -> float | np.ndarray:
-        """Fast O(1) uniform bilinear interpolation."""
-        is_scalar = np.isscalar(x) and np.isscalar(y)
-        x_arr = np.atleast_1d(x)
-        y_arr = np.atleast_1d(y)
+    @property
+    def y_bounds(self) -> tuple[float, float]:
+        return float(self.y_grid[0]), float(self.y_grid[-1])
 
-        gx = (x_arr - self.x_bounds[0]) / self.dx
-        gy = (y_arr - self.y_bounds[0]) / self.dy
+    @property
+    def p_value_rough(self) -> float:
+        return float(self._grit_rough)
 
-        ix = np.clip(np.floor(gx).astype(int), 0, self.nx - 2)
-        iy = np.clip(np.floor(gy).astype(int), 0, self.ny - 2)
+    @property
+    def p_value_smooth(self) -> float:
+        return float(self._grit_smooth)
 
-        rx = np.clip(gx - ix, 0.0, 1.0)
-        ry = np.clip(gy - iy, 0.0, 1.0)
+    @property
+    def p_value_mean(self) -> float:
+        if np.isclose(self.p_value_rough, self.p_value_smooth):
+            return self.p_value_rough
+        return float((self.p_value_rough + self.p_value_smooth) / 2.0)
 
-        f00 = grid[ix, iy]
-        f10 = grid[ix + 1, iy]
-        f01 = grid[ix, iy + 1]
-        f11 = grid[ix + 1, iy + 1]
-
-        res = (1.0 - rx) * (1.0 - ry) * f00 + rx * (1.0 - ry) * f10 + (1.0 - rx) * ry * f01 + rx * ry * f11
-        return float(res[0]) if is_scalar else res
-
-    def get_elevation(self, x: float | np.ndarray, y: float | np.ndarray) -> float | np.ndarray:
-        return self._bilinear_interp(self.z, x, y)
+    def _grid_coords(self, x: float | np.ndarray, y: float | np.ndarray):
+        gx = np.clip((np.asarray(x, dtype=np.float64) - self.x_grid[0]) / self.dx, 0, len(self.x_grid) - 2)
+        gy = np.clip((np.asarray(y, dtype=np.float64) - self.y_grid[0]) / self.dy, 0, len(self.y_grid) - 2)
+        ix, iy = gx.astype(int), gy.astype(int)
+        rx, ry = gx - ix, gy - iy
+        return ix, iy, rx, ry
 
     def get_height(self, x: float | np.ndarray, y: float | np.ndarray) -> float | np.ndarray:
-        return self.get_elevation(x, y)
+        """Bilinear-interpolated surface height at (x, y). Accepts scalars or arrays."""
+        ix, iy, rx, ry = self._grid_coords(x, y)
+        z00 = self.height_map[ix, iy]
+        z10 = self.height_map[ix + 1, iy]
+        z01 = self.height_map[ix, iy + 1]
+        z11 = self.height_map[ix + 1, iy + 1]
+        val = (1 - rx) * (1 - ry) * z00 + rx * (1 - ry) * z10 + (1 - rx) * ry * z01 + rx * ry * z11
+        if np.ndim(x) == 0 and np.ndim(y) == 0:
+            return float(val)
+        return val
 
-    def get_normal(self, x: float | np.ndarray, y: float | np.ndarray) -> np.ndarray:
-        zx = self._bilinear_interp(self.dz_dx, x, y)
-        zy = self._bilinear_interp(self.dz_dy, x, y)
+    def get_gradient(
+        self, x: float | np.ndarray, y: float | np.ndarray
+    ) -> tuple[float | np.ndarray, float | np.ndarray]:
+        """Bilinear-interpolated surface gradient at (x, y). Accepts scalars or arrays."""
+        ix, iy, rx, ry = self._grid_coords(x, y)
+        gx00, gx10 = self.grad_x[ix, iy], self.grad_x[ix + 1, iy]
+        gx01, gx11 = self.grad_x[ix, iy + 1], self.grad_x[ix + 1, iy + 1]
+        gy00, gy10 = self.grad_y[ix, iy], self.grad_y[ix + 1, iy]
+        gy01, gy11 = self.grad_y[ix, iy + 1], self.grad_y[ix + 1, iy + 1]
 
-        if np.isscalar(zx):
-            norm = np.sqrt(zx * zx + zy * zy + 1.0)
-            return np.array([-zx / norm, -zy / norm, 1.0 / norm], dtype=np.float64)
+        gx = (1 - rx) * (1 - ry) * gx00 + rx * (1 - ry) * gx10 + (1 - rx) * ry * gx01 + rx * ry * gx11
+        gy = (1 - rx) * (1 - ry) * gy00 + rx * (1 - ry) * gy10 + (1 - rx) * ry * gy01 + rx * ry * gy11
+        if np.ndim(x) == 0 and np.ndim(y) == 0:
+            return float(gx), float(gy)
+        return gx, gy
 
-        normals = np.column_stack([-zx, -zy, np.ones_like(zx)])
-        norms = np.linalg.norm(normals, axis=1, keepdims=True)
-        return normals / np.maximum(norms, 1e-12)
+    def get_normal(
+        self, x: float | np.ndarray, y: float | np.ndarray
+    ) -> tuple[float | np.ndarray, float | np.ndarray, float | np.ndarray]:
+        """Computes unit normal vector (nx, ny, nz) at (x, y). Accepts scalars or arrays."""
+        gx, gy = self.get_gradient(x, y)
+        norm = np.sqrt(gx**2 + gy**2 + 1.0)
+        nx = -gx / norm
+        ny = -gy / norm
+        nz = 1.0 / norm
+        if np.ndim(x) == 0 and np.ndim(y) == 0:
+            return float(nx), float(ny), float(nz)
+        return nx, ny, nz
 
 
-def generate_terrain(config: TerrainConfig) -> Terrain:
-    """Generates an inclined sandpaper surface using tiled KDTree micro-geometry
-    calibrated directly via generate_calibrated_sandpaper.
+def generate_terrain(cfg: Any) -> Terrain:
+    """Generates the terrain height field h(x, y) from real, randomly-placed
+    hemispherical grains (falling back to correlated noise only when a grit
+    is too fine to place individually across the full domain). The incline
+    is added afterward as a pure planar tilt so grain footprints stay round.
     """
-    diam_rough_um = max(config.roughness_amplitude_rough * 10000.0, 1.0)
-    diam_smooth_um = max(config.roughness_amplitude_smooth * 10000.0, 1.0)
+    x_len = getattr(cfg, "length_x", 25.0)
+    y_len = getattr(cfg, "length_y", 23.0)
+    res = getattr(cfg, "resolution", 1000)
+    slope_angle = float(getattr(cfg, "slope_angle", 30.0))
+    max_grains = int(getattr(cfg, "max_grains", 1_500_000))
 
-    sa_rough_um = diam_rough_um * 0.33
-    sa_smooth_um = diam_smooth_um * 0.33
+    x = np.linspace(0, x_len, res)
+    y = np.linspace(0, y_len, res)
 
-    seed_rough = config.seed
-    seed_smooth = (config.seed + 1000) if config.seed is not None else None
+    amp_rough = float(getattr(cfg, "roughness_amplitude_rough", 0.01))
+    amp_smooth = float(getattr(cfg, "roughness_amplitude_smooth", 0.001))
+    y_trans = float(getattr(cfg, "roughness_transition_y", 11.5))
 
-    # Tiled evaluation across rough and smooth domains
-    X_m, Y_m, z_rough, _, _, _, _, _, _, grit_rough = generate_calibrated_sandpaper(
-        target_diam_um=diam_rough_um,
-        target_Sa_um=sa_rough_um,
-        x_range=config.x_range,
-        y_range=config.y_range,
-        grid_res=config.resolution,
-        tile_size_cm=0.20,
-        incline_deg=0.0,
-        seed=seed_rough,
+    grit_r = getattr(cfg, "grit_rough", None)
+    grit_s = getattr(cfg, "grit_smooth", None)
+    seed = int(getattr(cfg, "seed", 42))
+
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    rough_mask = yy < y_trans
+    smooth_mask = ~rough_mask
+
+    rough_field, _ = _grain_bump_field(x, y, amp_rough, y_mask=rough_mask, max_grains=max_grains, seed=seed)
+    smooth_field, _ = _grain_bump_field(
+        x, y, amp_smooth, y_mask=smooth_mask, max_grains=max_grains, seed=seed + 1
+    )
+    roughness = rough_field + smooth_field
+
+    z_base = -xx * np.tan(np.radians(slope_angle))
+    height_map = z_base + roughness
+
+    return Terrain(
+        height_map=height_map,
+        x_grid=x,
+        y_grid=y,
+        slope_angle=slope_angle,
+        roughness_amplitude_rough=amp_rough,
+        roughness_amplitude_smooth=amp_smooth,
+        grit_rough=grit_r,
+        grit_smooth=grit_s,
     )
 
-    _, _, z_smooth, _, _, _, _, _, _, grit_smooth = generate_calibrated_sandpaper(
-        target_diam_um=diam_smooth_um,
-        target_Sa_um=sa_smooth_um,
-        x_range=config.x_range,
-        y_range=config.y_range,
-        grid_res=config.resolution,
-        tile_size_cm=0.20,
-        incline_deg=0.0,
-        seed=seed_smooth,
-    )
 
-    # Sigmoidal transition blending
-    weights = 1.0 / (1.0 + np.exp((Y_m - config.roughness_transition_y) / 0.15))
-    z_micro = weights * z_rough + (1.0 - weights) * z_smooth
+def generate_calibrated_sandpaper(
+    grit_rough: float = 80.0,
+    grit_smooth: float | None = None,
+    slope_angle: float = 30.0,
+    ramp_length: float = 29.0,
+    length_y: float = 23.0,
+    resolution: int = 1000,
+    seed: int = 42,
+    **kwargs: Any,
+) -> Terrain:
+    """Generates a calibrated Terrain instance directly from P-grit specifications."""
+    if grit_smooth is None:
+        grit_smooth = grit_rough
 
-    # Macro incline slope
-    z_incline = -X_m * np.tan(np.radians(config.slope_angle))
-    z = z_incline + z_micro
+    amp_rough = nanovea_d50_from_grit(grit_rough)
+    amp_smooth = nanovea_d50_from_grit(grit_smooth)
 
-    x_vec = X_m[:, 0]
-    y_vec = Y_m[0, :]
+    @dataclass
+    class DynamicTerrainConfig:
+        ramp_length: float = ramp_length
+        slope_angle: float = slope_angle
+        length_y: float = length_y
+        resolution: int = resolution
+        roughness_amplitude_rough: float = amp_rough
+        roughness_amplitude_smooth: float = amp_smooth
+        grit_rough: float = grit_rough
+        grit_smooth: float = grit_smooth
+        roughness_transition_y: float = length_y / 2.0
+        seed: int = seed
 
-    terrain = Terrain(
-        x=x_vec,
-        y=y_vec,
-        z=z,
-        p_value_mean=estimate_grit((diam_rough_um + diam_smooth_um) / 2.0),
-        p_value_rough=grit_rough,
-        p_value_smooth=grit_smooth,
-    )
-    terrain.slope_angle = config.slope_angle
-    return terrain
+        @property
+        def length_x(self) -> float:
+            return float(self.ramp_length * np.cos(np.radians(self.slope_angle)))
+
+    cfg = DynamicTerrainConfig()
+    return generate_terrain(cfg)

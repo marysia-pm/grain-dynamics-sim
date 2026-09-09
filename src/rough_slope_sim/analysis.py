@@ -7,10 +7,10 @@ from numpy.typing import NDArray
 from scipy.stats import ks_2samp, wasserstein_distance
 
 from .simulation import Trajectory
+from .terrain import nanovea_d50_from_grit
 
 
 def _xy_arrays(t: Trajectory | NDArray) -> tuple[NDArray, NDArray]:
-    """Extracts (x, y) arrays from either a Trajectory or a raw [frame, x, y] array."""
     if isinstance(t, Trajectory):
         return t.x, t.y
     return t[:, 1], t[:, 2]
@@ -19,14 +19,12 @@ def _xy_arrays(t: Trajectory | NDArray) -> tuple[NDArray, NDArray]:
 def trajectories_at_x_slice(
     trajectories: list[Trajectory] | list[NDArray], x_slice: float
 ) -> NDArray[np.float64]:
-    """Interpolates lateral Y positions across all trajectories at a fixed downslope X plane."""
     y_interp_list = []
     for t in trajectories:
         x_arr, y_arr = _xy_arrays(t)
         if x_arr is None or len(x_arr) < 2:
             continue
 
-        # Check monotonic condition to avoid unnecessary sorting
         if not np.all(x_arr[:-1] <= x_arr[1:]):
             sort_idx = np.argsort(x_arr)
             x_sorted, y_sorted = x_arr[sort_idx], y_arr[sort_idx]
@@ -40,13 +38,11 @@ def trajectories_at_x_slice(
 
 
 def variance_over_time(trajectories: list[Trajectory], attr: str = "y") -> NDArray[np.float64]:
-    """Cross-ensemble variance of `attr` at each simulation time step."""
     arrays = [getattr(t, attr) for t in trajectories if len(getattr(t, attr)) > 0]
     if not arrays:
-        return np.array([])
+        return np.array([], dtype=np.float64)
 
-    lens = [len(a) for a in arrays]
-    max_len = max(lens)
+    max_len = max(len(a) for a in arrays)
     padded = np.full((len(arrays), max_len), np.nan, dtype=np.float64)
 
     for i, a in enumerate(arrays):
@@ -57,7 +53,6 @@ def variance_over_time(trajectories: list[Trajectory], attr: str = "y") -> NDArr
 
 
 def compare_distributions(y_exp: NDArray[np.float64], y_sim: NDArray[np.float64]) -> dict[str, float]:
-    """Calculates statistical distance metrics between experimental and simulated distributions."""
     valid_exp = y_exp[~np.isnan(y_exp)]
     valid_sim = y_sim[~np.isnan(y_sim)]
 
@@ -85,7 +80,6 @@ def compare_distributions(y_exp: NDArray[np.float64], y_sim: NDArray[np.float64]
 def calculate_diffusion_coefficient(
     y_positions: NDArray[np.float64], x_slice: float, mean_vx: float = 30.0
 ) -> float:
-    """Estimates lateral diffusion coefficient D = Var(Y) / (2 * t) where t = x / vx."""
     valid_y = y_positions[~np.isnan(y_positions)]
     if len(valid_y) < 2 or mean_vx <= 0:
         return np.nan
@@ -97,7 +91,6 @@ def calculate_diffusion_coefficient(
 def compute_surface_center_stats(
     trajectories: list[Trajectory] | list[NDArray], x_eval: float = 15.0
 ) -> dict[str, float]:
-    """Calculates center metrics (mean and median Y) for dual-grit surface evaluations."""
     y_vals = trajectories_at_x_slice(trajectories, x_eval)
     valid_y = y_vals[~np.isnan(y_vals)]
     if len(valid_y) == 0:
@@ -110,19 +103,14 @@ def compute_surface_center_stats(
 
 
 def particle_size_from_grit(grit: float) -> float:
-    """Calculates particle size in micrometers from grit number (P-value)."""
-    return 173.014 * np.exp(-0.00408466 * grit) + 21.3533
+    """Calculates particle size in micrometers using calibrated Nanovea lookup/fit."""
+    d50_cm = nanovea_d50_from_grit(grit)
+    return float(d50_cm * 10000.0)
 
 
 def get_experimental_start_position(
     exp_trajectories: list[np.ndarray],
 ) -> tuple[float, float]:
-    """Extracts the average starting (x, y) coordinates across all experimental trajectories.
-
-    Assumes each trajectory in `exp_trajectories` has shape (N, 3+) where:
-      - col 1: x position (cm)
-      - col 2: y position (cm)
-    """
     if not exp_trajectories:
         return 0.0, 0.0
 

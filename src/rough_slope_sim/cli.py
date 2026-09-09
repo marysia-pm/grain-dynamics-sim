@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from rough_slope_sim import analysis, plotting
@@ -13,9 +14,7 @@ from rough_slope_sim.simulation import run_ensemble_parallel
 from rough_slope_sim.terrain import generate_terrain
 
 
-def _save(fig, out_dir: Path, name: str) -> None:
-    import matplotlib.pyplot as plt
-
+def _save(fig: plt.Figure, out_dir: Path, name: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{name}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -24,10 +23,10 @@ def _save(fig, out_dir: Path, name: str) -> None:
 
 
 def run_pipeline(out_dir: Path, seed: int | None) -> None:
-    terrain_config = TerrainConfig(roughness_transition_y=2.5, seed=seed)
+    terrain_config = TerrainConfig(roughness_transition_y=2.5, seed=seed if seed is not None else 42)
     ball, physics = BallConfig(), PhysicsConfig()
-    physics.slope_angle = terrain_config.slope_angle  # keep the two in sync
-    ensemble = EnsembleConfig(seed=seed, k_max=200)
+    physics.slope_angle = terrain_config.slope_angle
+    ensemble = EnsembleConfig(seed=seed if seed is not None else 42, k_max=200)
 
     print("Generating terrain...")
     terrain = generate_terrain(terrain_config)

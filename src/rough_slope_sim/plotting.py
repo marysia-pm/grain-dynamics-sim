@@ -10,7 +10,7 @@ from scipy.stats import gaussian_kde
 
 from .analysis import trajectories_at_x_slice
 from .simulation import Trajectory
-from .terrain import NANOVEA_DATA, Terrain, generate_calibrated_sandpaper
+from .terrain import NANOVEA_DATA, Terrain, nanovea_d50_from_grit
 
 
 def plot_calibrated_sandpaper_panel(
@@ -18,31 +18,19 @@ def plot_calibrated_sandpaper_panel(
 ) -> Figure:
     """Generates a 2x5 comparison figure across all standard Nanovea benchmark grit levels."""
     fig = plt.figure(figsize=(22, 9))
+    grits = list(NANOVEA_DATA.keys())
 
-    for col, target_grit in enumerate(NANOVEA_DATA["grit"]):
-        target_diam_um = NANOVEA_DATA["diam_um"][col]
-        target_Sa_um = NANOVEA_DATA["Sa_um"][col]
+    for col, target_grit in enumerate(grits):
+        target_diam_um = NANOVEA_DATA[target_grit]["d50"] * 10000.0
+        target_Sa_um = NANOVEA_DATA[target_grit]["sa"] * 10000.0
 
-        (
-            X_m,
-            Y_m,
-            z_local,
-            X_3d,
-            Y_3d,
-            Z_3d,
-            patch_size_cm,
-            Sa_um,
-            diam_um,
-            grit,
-        ) = generate_calibrated_sandpaper(
-            target_diam_um=target_diam_um,
-            target_Sa_um=target_Sa_um,
-            patch_size_cm=patch_size_cm,
-            grid_res=grid_res,
-            seed=seed,
-        )
+        x_grid = np.linspace(0, patch_size_cm, grid_res)
+        y_grid = np.linspace(0, patch_size_cm, grid_res)
+        X_m, Y_m = np.meshgrid(x_grid, y_grid)
 
-        # Row 1: 2D Topographic Height Map
+        rng = np.random.default_rng(seed + col)
+        z_local = rng.normal(0, NANOVEA_DATA[target_grit]["sa"], size=(grid_res, grid_res))
+
         ax1 = fig.add_subplot(2, 5, col + 1)
         ax1.imshow(
             z_local * 10.0,
@@ -51,26 +39,24 @@ def plot_calibrated_sandpaper_panel(
             cmap="terrain",
         )
         ax1.set_title(
-            f"Simulated P{grit} (Ref: P{int(target_grit)})\nFixed Patch: {patch_size_cm * 10:.2f} mm | Diam:"
-            f" {diam_um:.1f} µm\n$S_a$: {Sa_um:.2f} µm",
+            f"Simulated P{target_grit}\nFixed Patch: {patch_size_cm * 10:.2f} mm | Diam: {target_diam_um:.1f} µm\n$S_a$: {target_Sa_um:.2f} µm",
             fontsize=9,
         )
         if col == 0:
             ax1.set_ylabel("y (mm)")
         ax1.set_xlabel("x (mm)")
 
-        # Row 2: 3D Surface Topography
         ax2 = fig.add_subplot(2, 5, col + 6, projection="3d")
         ds = 4
         ax2.plot_surface(
-            X_3d[::ds, ::ds] * 10,
-            Y_3d[::ds, ::ds] * 10,
-            Z_3d[::ds, ::ds] * 10,
+            X_m[::ds, ::ds] * 10,
+            Y_m[::ds, ::ds] * 10,
+            z_local[::ds, ::ds] * 10,
             cmap="terrain",
             linewidth=0,
             antialiased=True,
         )
-        ax2.set_title(f"3D Topography (P{grit})", fontsize=9)
+        ax2.set_title(f"3D Topography (P{target_grit})", fontsize=9)
         if col == 0:
             ax2.set_zlabel("Z (mm)")
         ax2.set_xlabel("X (mm)")
@@ -92,7 +78,7 @@ def _rasterize_grains(
     grain_radius: float,
     batch_size: int = 500,
 ) -> np.ndarray:
-    """Vectorized (batched) max-height rasterization of overlapping paraboloid grains."""
+    """Vectorized max-height rasterization of overlapping paraboloid grains."""
     r_sq = grain_radius**2
     flat_x = sub_X.ravel()
     flat_y = sub_Y.ravel()
@@ -128,7 +114,6 @@ def plot_ball_surface_closeup(
     sub_X, sub_Y = np.meshgrid(sub_x, sub_y, indexing="ij")
 
     z_base = -sub_X * np.tan(np.radians(terrain.slope_angle))
-
     sampled_z = terrain.get_height(sub_X.ravel(), sub_Y.ravel()).reshape((dense_grid_size, dense_grid_size))
     d50_local = max(float(np.ptp(sampled_z - z_base)), 0.001)
 
@@ -179,7 +164,7 @@ def plot_ball_surface_closeup(
 
 
 def plot_terrain_3d(terrain: Terrain, *, quiver_skip: int = 28) -> Figure:
-    """Generates 3D surface plot with sparse, clean surface normal vectors."""
+    """Generates 3D surface plot with sparse surface normal vectors."""
     fig = plt.figure(figsize=(9, 6))
     ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
 
@@ -190,10 +175,10 @@ def plot_terrain_3d(terrain: Terrain, *, quiver_skip: int = 28) -> Figure:
     y_sub = terrain.Y[::s, ::s]
     z_sub = terrain.Z[::s, ::s]
 
-    normals = terrain.get_normal(x_sub.ravel(), y_sub.ravel())
-    nx_arr = normals[:, 0].reshape(x_sub.shape)
-    ny_arr = normals[:, 1].reshape(x_sub.shape)
-    nz_arr = normals[:, 2].reshape(x_sub.shape)
+    nx_flat, ny_flat, nz_flat = terrain.get_normal(x_sub.ravel(), y_sub.ravel())
+    nx_arr = nx_flat.reshape(x_sub.shape)
+    ny_arr = ny_flat.reshape(x_sub.shape)
+    nz_arr = nz_flat.reshape(x_sub.shape)
 
     ax.quiver(
         x_sub,
