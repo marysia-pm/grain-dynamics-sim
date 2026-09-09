@@ -6,67 +6,28 @@ encoded in the terrain height field (see terrain.py), so it shows up here
 only through the local surface normal.
 
 Contact model: instantaneous collision response with restitution, not a
-penalty spring. When the ball's surface touches the terrain, its position is
-snapped onto the surface along the local normal and the normal component of
+penalty spring. When the ball touches the terrain, its position is snapped
+onto the surface along the local normal and the normal component of
 velocity is reflected and scaled by `restitution` (0 = fully inelastic,
 1 = perfectly elastic). This avoids the stiff-spring stability problems of a
-penalty method (no k_n/dt tuning needed) while still giving bouncy behavior.
-Coulomb friction (optional, off by default) decelerates the tangential
-velocity while in contact.
+penalty method while still giving bouncy behavior. Coulomb friction
+(off by default) decelerates the tangential velocity while in contact.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
+
+from .config import BallConfig, EnsembleConfig, PhysicsConfig, SimConfig
 
 try:
     import torch
 except ImportError:  # torch is only used for optional reproducible seeding
     torch = None
-
-
-@dataclass
-class BallConfig:
-    """Configuration parameters for the rolling/bouncing sphere."""
-
-    x0: float = 0.1
-    y0: float = 11.5
-    z0: float | None = None  # None -> spawn resting on the surface
-    vx0: float = 0.0
-    vy0: float = 0.0
-    vz0: float = 0.0
-    radius: float = 0.125  # cm
-    mass: float = 1.0  # g
-    restitution: float = 0.3  # 0 = inelastic, 1 = perfectly elastic bounce
-    friction_mu: float = 0.0  # Coulomb friction coefficient while in contact
-
-
-@dataclass
-class PhysicsConfig:
-    """Global physical constants."""
-
-    gravity: float = 981.0  # cm/s^2, magnitude only — direction is always -z
-
-    @property
-    def g(self) -> float:
-        """Alias property for backwards compatibility."""
-        return self.gravity
-
-
-@dataclass
-class SimConfig:
-    """Simulation time-stepping, output, and execution options."""
-
-    dt: float = 1e-4
-    t_max: float = 5.0
-    num_runs: int = 10
-    num_workers: int = 4
-    seed: int | None = 42
-    save_interval: int = 10
 
 
 @dataclass
@@ -99,8 +60,8 @@ def run_simulation(
     """Integrates 3D motion of a sphere bouncing/sliding over rough terrain
     under plain vertical gravity, using restitution-based collision response.
     """
-    dt = float(getattr(sim_cfg, "dt", 1e-4))
-    t_max = float(getattr(sim_cfg, "t_max", 5.0))
+    dt = float(getattr(sim_cfg, "dt", 5e-4))
+    t_max = float(getattr(sim_cfg, "t_max", 2.0))
     save_interval = int(getattr(sim_cfg, "save_interval", 10))
 
     r = float(ball_cfg.radius)
@@ -116,7 +77,7 @@ def run_simulation(
     vx, vy, vz = float(ball_cfg.vx0), float(ball_cfg.vy0), float(ball_cfg.vz0)
 
     g = float(getattr(phys_cfg, "gravity", getattr(phys_cfg, "g", 981.0)))
-    gravity_vec = np.array([0.0, 0.0, -g], dtype=np.float64)
+    gz = -g  # gravity always points straight down in world coordinates
 
     x_min, x_max = terrain.x_bounds
     y_min, y_max = terrain.y_bounds
@@ -152,17 +113,13 @@ def run_simulation(
             tz_hist[rec_idx] = float(terrain.get_height(x, y))
             rec_idx += 1
 
-        # 1. Free-fall / unconstrained integration under plain gravity.
-        vx += gravity_vec[0] * dt
-        vy += gravity_vec[1] * dt
-        vz += gravity_vec[2] * dt
-
+        # 1. Free-fall / unconstrained integration under plain vertical gravity.
+        vz += gz * dt
         x += vx * dt
         y += vy * dt
         z += vz * dt
 
-        # 2. Collision detection & response against the (possibly moved-to)
-        #    surface, using the surface normal at the new (x, y).
+        # 2. Collision detection & response against the surface at the new (x, y).
         z_surf = float(terrain.get_height(x, y))
         dz_dx, dz_dy = terrain.get_gradient(x, y)
         n_raw = np.array([-float(dz_dx), -float(dz_dy), 1.0], dtype=np.float64)
@@ -183,8 +140,6 @@ def run_simulation(
             v_normal = np.dot(v_vec, n)
 
             if v_normal < 0.0:
-                # Reflect the normal component with restitution; leave the
-                # tangential component untouched here (friction handles it).
                 v_vec = v_vec - (1.0 + e) * v_normal * n
 
             if mu > 0.0:
@@ -228,80 +183,76 @@ def simulate_single_ball(
 
 
 def _single_run_worker(args: tuple) -> TrajectoryRecord:
-    terrain, state, phys_cfg, sim_cfg, seed = args
+    terrain, ball_cfg, phys_cfg, sim_cfg, state, seed = args
 
     if seed is not None:
         np.random.seed(seed)
         if torch is not None:
             torch.manual_seed(seed)
 
-    if callable(getattr(sim_cfg, "runner", None)):
-        return sim_cfg.runner(terrain, state, phys_cfg, sim_cfg)
-
-    if isinstance(state, (tuple, list)):
-        b_cfg = BallConfig(
-            x0=float(state[0]),
-            y0=float(state[1]),
-            vx0=float(state[2]) if len(state) > 2 else 0.0,
-            vy0=float(state[3]) if len(state) > 3 else 0.0,
-        )
-    else:
-        b_cfg = state
+    x0, y0 = float(state[0]), float(state[1])
+    vx0 = float(state[2]) if len(state) > 2 else 0.0
+    vy0 = float(state[3]) if len(state) > 3 else 0.0
+    b_cfg = replace(ball_cfg, x0=x0, y0=y0, vx0=vx0, vy0=vy0)
 
     return run_simulation(terrain, b_cfg, phys_cfg, sim_cfg)
 
 
 def run_ensemble_parallel(
     terrain: Any,
-    states: Any,
-    phys_cfg: Any,
-    sim_cfg: Any = None,
+    ball_cfg: BallConfig,
+    phys_cfg: PhysicsConfig,
+    sim_cfg: SimConfig | None = None,
+    ensemble_cfg: EnsembleConfig | None = None,
+    initial_states: list[tuple[float, float, float, float]] | None = None,
     workers: int | None = None,
-    initial_states: list | None = None,
     show_progress: bool = False,
     desc: str | None = None,
 ) -> list[TrajectoryRecord]:
-    if initial_states is not None:
-        states = initial_states
+    """Runs an ensemble of balls in parallel.
 
+    Initial (x0, y0, vx0, vy0) states come from `initial_states` if given,
+    otherwise are jittered from `ensemble_cfg`, otherwise a single run at
+    `ball_cfg`'s own initial state. Per-ball radius/mass/restitution/friction
+    come from `ball_cfg`; only position/velocity are overridden per run.
+    """
     if sim_cfg is None:
         sim_cfg = SimConfig()
 
-    if not isinstance(states, (list, tuple, np.ndarray)):
-        num_runs = int(
-            getattr(
-                sim_cfg,
-                "num_runs",
-                getattr(sim_cfg, "ensemble_size", getattr(sim_cfg, "k_max", getattr(sim_cfg, "n_runs", 1))),
-            )
-        )
-        ensemble_states = [states] * num_runs
+    if initial_states is not None:
+        states = list(initial_states)
+    elif ensemble_cfg is not None:
+        rng = np.random.default_rng(ensemble_cfg.seed)
+        states = []
+        for _ in range(ensemble_cfg.k_max):
+            dx = rng.normal(0.0, ensemble_cfg.x_jitter_std)
+            dy = rng.uniform(-ensemble_cfg.y_jitter_max, ensemble_cfg.y_jitter_max)
+            states.append((ensemble_cfg.start_x + dx, ensemble_cfg.start_y + dy, 0.0, 0.0))
     else:
-        ensemble_states = list(states)
+        states = [(ball_cfg.x0, ball_cfg.y0, ball_cfg.vx0, ball_cfg.vy0)]
 
-    num_sims = len(ensemble_states)
+    num_sims = len(states)
     if num_sims == 0:
         return []
 
     if workers is None:
-        workers = int(
-            getattr(
-                sim_cfg,
-                "num_workers",
-                getattr(sim_cfg, "workers", getattr(sim_cfg, "n_jobs", 4)),
-            )
-        )
+        workers = int(getattr(sim_cfg, "num_workers", 4))
     workers = max(1, min(int(workers), num_sims))
 
-    base_seed = getattr(sim_cfg, "seed", getattr(sim_cfg, "random_seed", None))
+    base_seed = getattr(sim_cfg, "seed", None)
     seeds = [base_seed + i for i in range(num_sims)] if base_seed is not None else [None] * num_sims
 
-    task_args = [(terrain, ensemble_states[i], phys_cfg, sim_cfg, seeds[i]) for i in range(num_sims)]
+    task_args = [(terrain, ball_cfg, phys_cfg, sim_cfg, states[i], seeds[i]) for i in range(num_sims)]
 
     if workers == 1:
-        return [_single_run_worker(args) for args in task_args]
+        results = [_single_run_worker(args) for args in task_args]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            mapped = executor.map(_single_run_worker, task_args)
+            if show_progress:
+                from tqdm import tqdm
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        trajectories = list(executor.map(_single_run_worker, task_args))
+                mapped = tqdm(mapped, total=num_sims, desc=desc or "Simulating", leave=False)
+            results = list(mapped)
 
-    return trajectories
+    return results

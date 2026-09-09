@@ -6,7 +6,6 @@ import argparse
 import glob
 import os
 import re
-import torch
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,13 +15,11 @@ import pandas as pd
 from tqdm import tqdm
 
 from rough_slope_sim import (
-    Terrain,
     BallConfig,
     EnsembleConfig,
     PhysicsConfig,
     TerrainConfig,
     generate_terrain,
-    generate_terrain_gpu,
     run_ensemble_parallel,
 )
 from rough_slope_sim.analysis import (
@@ -115,10 +112,10 @@ def load_trajectories(folder: Path, ramp_length_proj_cm: float, target_x0: float
 
     if not trajs:
         return []
+
     start_x_mean = float(np.mean([t[0, 1] for t in trajs]))
     end_x_mean = float(np.mean([t[-1, 1] for t in trajs]))
 
-    # Orient trajectory direction so downslope is positive X
     if start_x_mean > end_x_mean or start_x_mean > (ramp_length_proj_cm / 2.0):
         for t in trajs:
             t[:, 1] = ramp_length_proj_cm - t[:, 1]
@@ -179,45 +176,16 @@ def process_folder(
         tqdm.write("  └── [!] No valid trajectories found. Skipping.")
         return None
 
-    # 2. Extract initial lateral positions (Y)
     exp_y_starts = [t[0, 2] for t in exp_trajs if len(t) > 0]
     y_min, y_max = float(np.min(exp_y_starts)), float(np.max(exp_y_starts))
 
-    # 3. Generate 3D Terrain directly on GPU
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    X, Y, Z, dz_dx, dz_dy = generate_terrain_gpu(
-        x_min=0.0,
-        x_max=x_max_proj,
-        y_min=0.0,
-        y_max=23.0,  # Full 23 cm plane width
-        dx=0.02,
-        dy=0.02,
-        slope_angle_deg=slope_angle_deg,
-        p_value_left=cfg.grit_left,
-        p_value_right=cfg.grit_right,
-        is_dual=cfg.is_dual,
-        device=device,
-    )
-
-    terrain = Terrain(
-        x=X,
-        y=Y,
-        z=Z,
-        dz_dx=dz_dx,
-        dz_dy=dz_dy,
-        slope_angle=slope_angle_deg,
-        p_value_rough=cfg.grit_left,
-        p_value_smooth=cfg.grit_right,
-    )
-
-    # 4. Configure initial states for simulation ensemble
     num_sim_balls = max(len(exp_trajs), 150)
     sim_y0_vals = sample_hybrid_y0(y_min, y_max, num_samples=num_sim_balls)
-    sampled_initial_states = [(target_x0, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
+    sampled_initial_states = [(0.1, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
 
     tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories (X release aligned to 0.1 cm)")
     tqdm.write(
-        f"  ├── Initial Config : Fixed X0 = {target_x0} cm, V0 = 0.0 | Hybrid Y0 in [{y_min:.2f}, {y_max:.2f}] cm"
+        f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0 | Hybrid Y0 in [{y_min:.2f}, {y_max:.2f}] cm"
     )
 
     # Construct TerrainConfig passing explicit grit values along with amplitudes
@@ -238,81 +206,68 @@ def process_folder(
     tqdm.write(f"  ├── Overall surface: {terrain.p_value_mean:.0f}P")
 
     ball_cfg = BallConfig(radius=0.125, x0=0.1)
-    physics_cfg = PhysicsConfig(gravity=981.0, slope_angle=slope_angle_deg)
+    physics_cfg = PhysicsConfig(gravity=981.0)
     e_cfg = EnsembleConfig(k_max=num_sim_balls, seed=42)
 
-    # 5. Run GPU-accelerated ensemble simulation
     sim_trajs = run_ensemble_parallel(
-        terrain=terrain,
-        ball=ball_cfg,
-        physics=phys_cfg,
-        ensemble=ens_cfg,
+        terrain,
+        ball_cfg,
+        physics_cfg,
+        e_cfg,
         initial_states=sampled_initial_states,
         show_progress=True,
-        use_gpu=True,
-        desc="  ├── Simulating ensemble",
+        desc=f"  ├── Simulating ({num_sim_balls} balls)",
     )
+    sim_trajs = [t for t in sim_trajs if len(t.x) > 0]
 
-    # 6. Calculate diffusion coefficients for both experiment and simulation
-    exp_diff = calculate_diffusion_coefficients(exp_trajs, fps=60.0, t_min=0.05, t_max=0.70)
-    sim_diff = calculate_diffusion_coefficients(sim_trajs, fps=60.0, t_min=0.05, t_max=0.70)
+    tqdm.write("  └── Generating plots...")
 
-    tqdm.write("  ├── Diffusion Coefficients (Dy):")
-    tqdm.write(
-        f"  │   ├── Exp Dy = {exp_diff['D_y']:.4f} cm²/s (Ds = {exp_diff['D_s']:.4f} cm²/cm, R² = {exp_diff['r_squared']:.3f})"
-    )
-    tqdm.write(
-        f"  │   └── Sim Dy = {sim_diff['D_y']:.4f} cm²/s (Ds = {sim_diff['D_s']:.4f} cm²/cm, R² = {sim_diff['r_squared']:.3f})"
-    )
-
-    # 7. Render and save all plots (Softmatter style, full domain plane, no tight_layout)
-    x_slices = [5.0, 15.0, 25.0]
-
-    # Plot 1: Full 23x29 cm Trajectories & Cross-Section Slices
-    fig_trajs = plot_trajectories_and_three_slices(
-        exp_trajs=exp_trajs,
-        sim_trajs=sim_trajs,
-        x_slices=x_slices,
-        is_dual=cfg.is_dual,
-        interface_y=11.5,
-    )
-    fig_trajs.savefig(sub_out / "trajectories_comparison.png", dpi=300)
-    plt.close(fig_trajs)
-
-    # Plot 2: Full 3D Terrain
-    fig_terrain = plot_terrain_3d(terrain)
-    fig_terrain.savefig(sub_out / "terrain_3d.png", dpi=300)
-    plt.close(fig_terrain)
-
-    # Plot 3: 3D Trajectories over Surface
-    fig_traj3d = plot_trajectories_3d(terrain, sim_trajs)
-    fig_traj3d.savefig(sub_out / "trajectories_3d.png", dpi=300)
-    plt.close(fig_traj3d)
-
-    # Plot 4: Contact Close-Up (Ball rendered on top of grains)
     fig_closeup = plot_ball_surface_closeup(
         terrain=terrain,
         ball_radius=ball_cfg.radius,
-        ball_x=10.0,
-        ball_y=11.5 if cfg.is_dual else 10.0,
+        ball_x=CLOSEUP_X,
+        ball_y=CLOSEUP_Y,
+        window_factor=3.0,
     )
-    fig_closeup.savefig(sub_out / "ball_surface_closeup.png", dpi=300)
+    fig_closeup.savefig(sub_out / "00_ball_surface_closeup.png", dpi=300, bbox_inches="tight")
     plt.close(fig_closeup)
 
-    # Plot 5: Ensemble Lateral Variance Growth
-    fig_var = plot_variance_over_time(sim_diff["t_grid"], sim_diff["var_y_t"])
-    fig_var.savefig(sub_out / "variance_over_time.png", dpi=300)
-    plt.close(fig_var)
+    fig_terrain = plot_terrain_3d(terrain, quiver_skip=28)
+    fig_terrain.savefig(sub_out / "01_terrain_3d_normals.png", dpi=150, bbox_inches="tight")
+    plt.close(fig_terrain)
 
-    tqdm.write("  └── [✓] Analysis & figures generated successfully.")
+    fig_traj3d = plot_trajectories_3d(terrain, sim_trajs)
+    fig_traj3d.savefig(sub_out / "02_terrain_trajectories_3d.png", dpi=150, bbox_inches="tight")
+    plt.close(fig_traj3d)
+
+    y_exp_15 = trajectories_at_x_slice(exp_trajs, 15.0)
+    y_sim_15 = trajectories_at_x_slice(sim_trajs, 15.0)
+
+    fig_hist = plot_experiment_vs_sim_distribution(y_exp_15, y_sim_15, x_slice=15.0)
+    fig_hist.savefig(sub_out / "03_histogram_15cm.png", dpi=150, bbox_inches="tight")
+    plt.close(fig_hist)
+
+    fig_slices = plot_trajectories_and_three_slices(
+        exp_trajs, sim_trajs, X_SLICES, is_dual=cfg.is_dual, interface_y=11.5
+    )
+    fig_slices.savefig(sub_out / "04_trajectories_and_3slices.png", dpi=150, bbox_inches="tight")
+    plt.close(fig_slices)
+
+    d_exp = calculate_diffusion_coefficient(y_exp_15, x_slice=15.0)
+    d_sim = calculate_diffusion_coefficient(y_sim_15, x_slice=15.0)
+    metrics = compare_distributions(y_exp_15, y_sim_15)
 
     return {
         "folder": folder_name,
-        "grit_left": cfg.grit_left,
-        "grit_right": cfg.grit_right,
         "is_dual": cfg.is_dual,
-        "exp_diff": exp_diff,
-        "sim_diff": sim_diff,
+        "slope_angle_deg": slope_angle_deg,
+        "x_max_proj_cm": x_max_proj,
+        "exp_start_y_min": y_min,
+        "exp_start_y_max": y_max,
+        "D_exp_cm2_s": d_exp,
+        "D_sim_cm2_s": d_sim,
+        "wasserstein_cm": metrics["wasserstein_distance"],
+        "ks_stat": metrics["ks_statistic"],
     }
 
 
