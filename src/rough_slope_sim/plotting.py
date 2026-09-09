@@ -10,33 +10,15 @@ from scipy.stats import gaussian_kde
 
 from .analysis import trajectories_at_x_slice
 from .simulation import Trajectory
-<<<<<<< HEAD
 from .terrain import NANOVEA_DATA, Terrain, nanovea_d50_from_grit
-=======
-from .terrain import NANOVEA_DATA, Terrain, generate_calibrated_sandpaper, nanovea_d50_from_grit
-
-# Apply softmatter matplotlib style with fallback
-try:
-    plt.style.use("https://raw.githubusercontent.com/turczyneq/softmatter-style/main/softmatter.mplstyle")
-except Exception:
-    pass
-
-# Global Domain Dimensions
-PLANE_X_CM = 29.0  # Downslope length
-PLANE_Y_CM = 23.0  # Lateral width
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
 
 
 def plot_calibrated_sandpaper_panel(
     patch_size_cm: float = 0.20, grid_res: int = 500, seed: int = 42
 ) -> Figure:
     """Generates a 2x5 comparison figure across all standard Nanovea benchmark grit levels."""
-<<<<<<< HEAD
     fig = plt.figure(figsize=(22, 9))
     grits = list(NANOVEA_DATA.keys())
-=======
-    fig = plt.figure(figsize=(22, 10))
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
 
     for col, target_grit in enumerate(grits):
         target_diam_um = NANOVEA_DATA[target_grit]["d50"] * 10000.0
@@ -57,15 +39,8 @@ def plot_calibrated_sandpaper_panel(
             cmap="terrain",
         )
         ax1.set_title(
-<<<<<<< HEAD
             f"Simulated P{target_grit}\nFixed Patch: {patch_size_cm * 10:.2f} mm | Diam: {target_diam_um:.1f} µm\n$S_a$: {target_Sa_um:.2f} µm",
             fontsize=9,
-=======
-            f"Simulated P{grit} (Ref: P{int(target_grit)})\nFixed Patch: {patch_size_cm * 10:.2f} mm | Diam: {diam_um:.1f} µm\n$S_a$: {Sa_um:.2f} µm",
-            fontsize=12,
-            fontweight="bold",
-            pad=10,
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
         )
         if col == 0:
             ax1.set_ylabel("y (mm)", fontsize=13, labelpad=8)
@@ -82,11 +57,7 @@ def plot_calibrated_sandpaper_panel(
             linewidth=0,
             antialiased=True,
         )
-<<<<<<< HEAD
         ax2.set_title(f"3D Topography (P{target_grit})", fontsize=9)
-=======
-        ax2.set_title(f"3D Topography (P{grit})", fontsize=12, fontweight="bold", pad=10)
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
         if col == 0:
             ax2.set_zlabel("Z (mm)", fontsize=12, labelpad=8)
         ax2.set_xlabel("X (mm)", fontsize=12, labelpad=8)
@@ -97,6 +68,7 @@ def plot_calibrated_sandpaper_panel(
         ax2.view_init(elev=25, azim=-60)
 
     return fig
+
 
 def _rasterize_grains(
     sub_X: np.ndarray,
@@ -178,8 +150,12 @@ def plot_ball_surface_closeup(
     fig = plt.figure(figsize=(10, 9))
     ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
 
-    ax.plot_surface(sub_X, sub_Y, sub_Z, cmap="gist_earth", alpha=0.9, edgecolor="none", antialiased=True, zorder=1)
-    ax.plot_surface(sphere_x, sphere_y, sphere_z, color="crimson", alpha=0.95, edgecolor="darkred", lw=0.3, zorder=10)
+    ax.plot_surface(
+        sub_X, sub_Y, sub_Z, cmap="gist_earth", alpha=0.9, edgecolor="none", antialiased=True, zorder=1
+    )
+    ax.plot_surface(
+        sphere_x, sphere_y, sphere_z, color="crimson", alpha=0.95, edgecolor="darkred", lw=0.3, zorder=10
+    )
 
     ax.set_box_aspect([1, 1, 1])
     ax.set_xlim(x_min, x_max)
@@ -205,13 +181,8 @@ def plot_ball_surface_closeup(
 
 
 def plot_terrain_3d(terrain: Terrain, *, quiver_skip: int = 28) -> Figure:
-<<<<<<< HEAD
     """Generates 3D surface plot with sparse surface normal vectors."""
     fig = plt.figure(figsize=(9, 6))
-=======
-    """Generates full 23x29 cm 3D surface plot with sparse normal vectors."""
-    fig = plt.figure(figsize=(11, 8))
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
     ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
 
     ax.plot_surface(terrain.X, terrain.Y, terrain.Z, cmap="summer", alpha=0.75, rstride=2, cstride=2)
@@ -225,8 +196,17 @@ def plot_terrain_3d(terrain: Terrain, *, quiver_skip: int = 28) -> Figure:
     nz_arr = nz_flat.reshape(x_sub.shape)
 
     ax.quiver(
-        x_sub, y_sub, z_sub, nx_arr, ny_arr, nz_arr,
-        length=0.25, color="crimson", alpha=0.9, linewidth=1.2, label="Surface Normals",
+        x_sub,
+        y_sub,
+        z_sub,
+        nx_arr,
+        ny_arr,
+        nz_arr,
+        length=0.25,
+        color="crimson",
+        alpha=0.9,
+        linewidth=1.2,
+        label="Surface Normals",
     )
 
     ax.set_xlim(0, PLANE_X_CM)
@@ -299,7 +279,9 @@ def plot_experiment_vs_sim_distribution(y_exp: np.ndarray, y_sim: np.ndarray, x_
         ax.plot(g_s, gaussian_kde(valid_sim)(g_s), color="#ff6f00", lw=2.5)
 
     ax.set_xlim(0, PLANE_Y_CM)
-    ax.set_title(f"Y Distribution Cross-Section at X = {x_slice:.1f} cm", fontsize=15, fontweight="bold", pad=12)
+    ax.set_title(
+        f"Y Distribution Cross-Section at X = {x_slice:.1f} cm", fontsize=15, fontweight="bold", pad=12
+    )
     ax.set_xlabel("Y Position (cm)", fontsize=13, labelpad=8)
     ax.set_ylabel("Probability Density", fontsize=13, labelpad=8)
     ax.tick_params(axis="both", labelsize=11)
@@ -368,7 +350,9 @@ def plot_trajectories_and_three_slices(
             ax_slice.axvline(interface_y, color="black", linestyle="-.", lw=1.5)
 
         ax_slice.set_xlim(0, PLANE_Y_CM)
-        ax_slice.set_title(f"Slice Cross-Section at X = {x_s:.1f} cm", color=c, fontsize=13, fontweight="bold", pad=8)
+        ax_slice.set_title(
+            f"Slice Cross-Section at X = {x_s:.1f} cm", color=c, fontsize=13, fontweight="bold", pad=8
+        )
         ax_slice.set_xlabel("Y Position (cm)", fontsize=12, labelpad=6)
         ax_slice.set_ylabel("Density", fontsize=12, labelpad=6)
         ax_slice.tick_params(axis="both", labelsize=11)

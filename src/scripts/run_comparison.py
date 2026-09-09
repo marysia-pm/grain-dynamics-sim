@@ -87,15 +87,8 @@ def _guess_scale(max_v: float) -> float:
     return 1.0
 
 
-<<<<<<< HEAD
 def load_trajectories(folder: Path, ramp_length_proj_cm: float, target_x0: float = 0.1) -> list[np.ndarray]:
     """Loads experimental trajectories, fixes orientation, and aligns release points to target_x0."""
-=======
-def load_trajectories(
-    folder: Path, ramp_length_proj_cm: float, target_x_start: float = 0.1
-) -> list[np.ndarray]:
-    """Loads experimental trajectories and aligns release point to X ~ target_x_start cm."""
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
     trajs = []
     column_renames = {"particle": "ball_id", "track_id": "ball_id", "pos_x": "x", "pos_y": "y"}
 
@@ -130,16 +123,10 @@ def load_trajectories(
         for t in trajs:
             t[:, 1] = ramp_length_proj_cm - t[:, 1]
 
-<<<<<<< HEAD
     # Align experimental tracks along X so every trajectory release point starts at target_x0
     for t in trajs:
         x_start = t[0, 1]
         t[:, 1] = t[:, 1] - x_start + target_x0
-=======
-    # Shift each trajectory so its initial release point starts at target_x_start (0.1 cm)
-    for t in trajs:
-        t[:, 1] = (t[:, 1] - t[0, 1]) + target_x_start
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
 
     return trajs
 
@@ -162,6 +149,7 @@ def sample_hybrid_y0(
 
     return blend_factor * u_samples + (1.0 - blend_factor) * g_samples
 
+
 def process_folder(
     exp_folder: Path,
     out_root: Path,
@@ -169,10 +157,6 @@ def process_folder(
     ramp_length_cm: float,
     x_max_proj: float,
 ) -> dict | None:
-<<<<<<< HEAD
-=======
-    """Runs the full experiment-vs-simulation comparison for one experimental folder."""
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
     folder_name = exp_folder.name
     cfg = parse_folder(folder_name)
 
@@ -188,16 +172,8 @@ def process_folder(
     sub_out = out_root / folder_name.replace("\\", "_").replace("/", "_")
     sub_out.mkdir(parents=True, exist_ok=True)
 
-<<<<<<< HEAD
     exp_trajs = [
         t for t in load_trajectories(exp_folder, ramp_length_proj_cm=x_max_proj, target_x0=0.1) if len(t) > 0
-=======
-    # 1. Load experimental trajectories zero-aligned to X0 = 0.1 cm
-    target_x0 = 0.1
-    exp_trajs = [
-        t for t in load_trajectories(exp_folder, ramp_length_proj_cm=x_max_proj, target_x_start=target_x0)
-        if len(t) > 0
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
     ]
     if not exp_trajs:
         tqdm.write("  └── [!] No valid trajectories found. Skipping.")
@@ -239,16 +215,11 @@ def process_folder(
     sim_y0_vals = sample_hybrid_y0(y_min, y_max, num_samples=num_sim_balls)
     sampled_initial_states = [(target_x0, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
 
-<<<<<<< HEAD
     tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories (X release aligned to 0.1 cm)")
-=======
-    tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} experimental trajectories")
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
     tqdm.write(
         f"  ├── Initial Config : Fixed X0 = {target_x0} cm, V0 = 0.0 | Hybrid Y0 in [{y_min:.2f}, {y_max:.2f}] cm"
     )
 
-<<<<<<< HEAD
     # Construct TerrainConfig passing explicit grit values along with amplitudes
     t_cfg = TerrainConfig(
         ramp_length=ramp_length_cm,
@@ -269,11 +240,6 @@ def process_folder(
     ball_cfg = BallConfig(radius=0.125, x0=0.1)
     physics_cfg = PhysicsConfig(gravity=981.0, slope_angle=slope_angle_deg)
     e_cfg = EnsembleConfig(k_max=num_sim_balls, seed=42)
-=======
-    ball_cfg = BallConfig()
-    phys_cfg = PhysicsConfig(slope_angle=slope_angle_deg)
-    ens_cfg = EnsembleConfig(k_max=num_sim_balls)
->>>>>>> 23c6a278ce2639c520448873a38c765a4a2c7822
 
     # 5. Run GPU-accelerated ensemble simulation
     sim_trajs = run_ensemble_parallel(
@@ -348,6 +314,7 @@ def process_folder(
         "exp_diff": exp_diff,
         "sim_diff": sim_diff,
     }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch-compare experiment vs. simulation for each surface.")
