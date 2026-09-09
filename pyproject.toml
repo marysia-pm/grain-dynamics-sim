@@ -3,16 +3,17 @@ name = "rough-slope-sim"
 version = "0.1.0"
 description = "Ball-on-rough-inclined-slope physics simulation and roughness/diffusion analysis (thesis code, refactored)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10, <3.13"
 license = { text = "MIT" }
 authors = [{ name = "Your Name" }]
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "matplotlib>=3.8",
-    "tqdm>=4.70.0",
-    "pandas>=2.3.3",
-    "opencv-python>=5.0.0.93",
+    "tqdm>=4.66.0",
+    "pandas>=2.1.0",
+    "opencv-python>=4.8.0",
+    "torch>=2.2.0",
 ]
 
 [project.scripts]
