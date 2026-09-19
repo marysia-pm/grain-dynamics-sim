@@ -1,169 +1,160 @@
-# rough-slope-sim
+# rough_slope_sim
 
-Physics simulation of a ball rolling down a rough, inclined surface, with
-tools to analyze how surface roughness affects the spread ("diffusion") of
-the ball's trajectories, and to relate abrasive grit size to measured
-surface roughness (Sa).
+Physics simulation of a ball rolling/bouncing down a rough inclined plane, used to
+compare against experimental grain-dynamics footage. Two surface types are
+supported: calibrated **sandpaper** (procedurally generated grains, calibrated
+against real Nanovea profilometry measurements) and a **Galton board** (regular
+peg lattice), on either a short benchtop ramp or a long, narrow track.
 
-This started as a single, 800-line Google Colab script (`thesis.py`) full of
-copy-pasted simulation loops and bare global variables. It has been
-refactored here into a small, tested, installable Python package with a
-clean API, a CLI, and no notebook-only assumptions (no `plt.show()` blocking
-calls, no reliance on globals surviving across cells, no undefined
-variables).
+## How it works
 
-## What it does
-
-1. **Terrain generation** (`rough_slope_sim.terrain`): builds an inclined
-   plane with spatially-correlated random roughness. The roughness amplitude
-   can switch from "rough" to "smooth" at a given y-coordinate, to model a
-   rough traction zone at the top of a slope.
-2. **Ball physics** (`rough_slope_sim.simulation`): integrates a ball's
-   3D trajectory down the slope, decomposing gravity into tangential
-   (surface-following) and normal (contact) components, with a
-   restitution-based bounce response when the ball penetrates the surface.
-3. **Analysis** (`rough_slope_sim.analysis`): ensemble statistics (variance
-   of position over time, final-position distributions), a grit-size /
-   Sa calibration curve fit, and a roughness sweep that tracks how a
-   "diffusion coefficient" (variance of final position) changes with
-   surface roughness.
-4. **Plotting** (`rough_slope_sim.plotting`): recreates all of the original
-   notebook's figures (3D terrain + normals, 3D trajectories, energy vs.
-   time, final-position scatter/histograms, variance over time, grit
-   calibration curves, roughness sweep) as reusable functions that return
-   `matplotlib` figures.
-5. **CLI** (`rough_slope_sim.cli`): runs the whole pipeline end-to-end and
-   saves every figure as a PNG.
-
-## What changed vs. the original notebook script
-
-- All bare global variables (`ball_radius`, `roughness_transition_y`,
-  `terrain_height_interpolator`, ...) became explicit dataclasses
-  (`TerrainConfig`, `BallConfig`, `PhysicsConfig`, `EnsembleConfig`) and
-  object attributes (`Terrain.get_height`, `Terrain.get_normal_vector`),
-  passed around instead of mutated in place.
-- The two nearly-identical, deeply nested simulation loops (one for a
-  single demo ball, one duplicated for the ensemble/plotting run) were
-  merged into a single, tested integration routine
-  (`simulate_single_ball` / `run_ensemble`).
-- The confusing "redo the last time step at higher resolution if we
-  detect penetration" logic was cleaned up into an explicit, testable rule:
-  take a single cheap step during free flight, but if that coarse step
-  would tunnel the ball past the surface, redo the same interval with
-  `denser_steps_number` fine sub-steps; while already in contact, always
-  use fine sub-stepping so the contact response is resolved accurately.
-- Fixed a bug in the roughness-sweep analysis where the code referenced an
-  undefined variable, `valid_final_x_positions`, instead of the array it
-  had actually just computed, `valid_final_y_positions` — this meant that
-  section of the original notebook could never run to completion.
-- Fixed `roughness_amplitude_smooth=0.0,` / `roughness_amplitude_rough=0.02,`
-  accidentally being defined as 1-tuples (trailing commas) at module scope.
-- Replaced blocking `plt.show()` calls throughout with functions that
-  return `Figure` objects, so plots can be saved, tested headlessly, or
-  displayed, as the caller prefers.
-- Added type hints, docstrings, and a test suite.
+- **Coordinate convention:** X-Y is the horizontal ground plane, Z is vertical
+  (up). Gravity always points straight down; the incline itself is entirely
+  encoded in the terrain's height field, so the ball only "feels" the slope
+  through the local surface gradient/normal.
+- **Terrain:** a baseline inclined plane with a procedural micro-roughness
+  (grains or pegs) added on top, sampled onto a grid and bilinearly
+  interpolated for height/gradient/normal queries.
+- **Contact model:** instantaneous collision response with restitution, not a
+  penalty spring. When the ball touches the surface, it's snapped onto it
+  along the local normal and the normal velocity component is reflected and
+  scaled by the ball's `restitution`. Coulomb friction (off by default)
+  decelerates the tangential velocity while in contact.
+- **Ensembles:** many balls can be simulated in parallel (`ProcessPoolExecutor`)
+  with jittered starting positions, then compared statistically (Wasserstein
+  distance, KS test, variance/diffusion coefficient) against experimental
+  trajectories extracted from tracking data.
 
 ## Installation
 
-This project uses [`uv`](https://docs.astral.sh/uv/) for dependency and
-environment management.
-
 ```bash
-# Install uv if you don't have it yet:
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and install (creates a .venv automatically):
-git clone <this-repo-url>
-cd rough-slope-sim
-uv sync
+pip install numpy scipy matplotlib pandas tqdm opencv-python
 ```
 
-`uv sync` installs runtime dependencies (`numpy`, `scipy`, `matplotlib`) plus
-the `dev` dependency group (`pytest`, `pytest-cov`, `ruff`) into a local
-`.venv`.
+`torch` is an optional dependency (used only for reproducible seeding of the
+worker processes) — the package works fine without it.
 
-## Usage
+Requires Python 3.10+ (uses `X | Y` union type hints throughout).
 
-### Run the full pipeline via the CLI
+## Project structure
 
-```bash
-uv run rough-slope-sim --out-dir output --seed 0
+```
+rough_slope_sim/            # the package
+├── __init__.py             # public API re-exports
+├── config.py                # dataclasses: TerrainConfig, BallConfig, PhysicsConfig, SimConfig, EnsembleConfig
+├── terrain.py                # terrain generation, Nanovea grit/Sa calibration, Terrain class
+├── simulation.py             # physics integration + parallel ensemble runner
+├── analysis.py                # statistical comparison, spatial slicing, diffusion coefficient
+├── plotting.py                # all figure-generation routines
+└── cli.py                     # `python -m rough_slope_sim.cli` terrain-generation CLI
+
+# top-level scripts (outside the package)
+├── create_galton.py           # run a Galton-board ensemble, export 5 standard plots
+├── run_comparison.py          # batch-compare experiment vs. simulation across surface folders
+├── run_long_sim.py            # large (600x30 cm) dual-grit plane simulation
+├── compare_initial_velocity.py# compare zero vs. non-zero impact velocity ensembles
+├── run_angle_analysis.py      # measure incline angle from a photo
+├── run_alignment_check.py     # detect rig alignment offsets from a photo
+└── exploring_surfaces.py      # exploratory grain-rendering script (superseded — see note below)
 ```
 
-This generates a terrain, runs an ensemble of ball trajectories, fits the
-grit-calibration curves, runs a roughness sweep, and writes every figure as
-a PNG into `output/`. Pass `--show` to also open interactive windows.
+## Quickstart
+
+### CLI: generate and export a terrain
 
 ```bash
-uv run rough-slope-sim --help
+# Sandpaper, default 1000x1000 grid
+python -m rough_slope_sim.cli --surface sandpaper --grit-rough 80 --output-dir output/sandpaper
+
+# Long/narrow domain: independent X/Y resolution
+python -m rough_slope_sim.cli --surface sandpaper \
+    --ramp-length 600 --length-y 30 \
+    --resolution-x 2400 --resolution-y 150 \
+    --output-dir output/long_plane
+
+# Galton board
+python -m rough_slope_sim.cli --surface galton --peg-shape cone --output-dir output/galton
 ```
 
-### Use it as a library
+### Python API: run an ensemble
 
 ```python
-from rough_slope_sim import BallConfig, PhysicsConfig, TerrainConfig, generate_terrain
-from rough_slope_sim.config import EnsembleConfig
-from rough_slope_sim.simulation import run_ensemble
-from rough_slope_sim.plotting import plot_trajectories_3d
-
-terrain = generate_terrain(TerrainConfig(alpha=30, resolution=300, seed=0))
-trajectories = run_ensemble(
-    terrain,
-    BallConfig(radius=0.5, mass=1.0),
-    PhysicsConfig(total_time=10.0),
-    EnsembleConfig(k_max=10, seed=0),
+from rough_slope_sim import (
+    TerrainConfig, BallConfig, PhysicsConfig, SimConfig, EnsembleConfig,
+    generate_terrain, run_ensemble_parallel, trajectories_at_x_slice,
+    calculate_diffusion_coefficient,
 )
 
-fig = plot_trajectories_3d(terrain, trajectories)
-fig.savefig("trajectories.png")
+terrain = generate_terrain(TerrainConfig(
+    ramp_length=29.0, slope_angle=30.0, length_y=23.0,
+    grit_rough=80.0, grit_smooth=120.0, roughness_transition_y=11.5,
+))
+
+trajectories = run_ensemble_parallel(
+    terrain,
+    BallConfig(radius=0.125, restitution=0.8),
+    PhysicsConfig(gravity=981.0),
+    sim_cfg=SimConfig(dt=5e-4, t_max=2.0),
+    ensemble_cfg=EnsembleConfig(k_max=150, start_x=0.1, start_y=11.5),
+    show_progress=True,
+)
+
+y_at_15cm = trajectories_at_x_slice(trajectories, x_slice=15.0)
+print("Lateral diffusion coefficient:", calculate_diffusion_coefficient(y_at_15cm, x_slice=15.0))
 ```
 
-See `examples/run_demo.py` for a complete runnable example.
-
-## Development
+### Comparing against experimental tracking data
 
 ```bash
-# Run the test suite
-uv run pytest
-
-# With coverage
-uv run pytest --cov=rough_slope_sim
-
-# Lint
-uv run ruff check .
+python run_comparison.py --exp-root ../grain-dynamics-analysis/processing_results --out-dir output
 ```
 
-## Project layout
+Each experiment subfolder is matched to a simulated ensemble; outputs are five
+plots per folder (contact close-up, 3D terrain, 3D trajectories, histogram,
+trajectory+slices) plus a `batch_summary_metrics.csv` with Wasserstein
+distance, KS statistic, and diffusion coefficients for every surface.
 
-```
-rough-slope-sim/
-├── pyproject.toml          # uv / package metadata & dependencies
-├── src/
-│   └── rough_slope_sim/
-│       ├── config.py       # TerrainConfig, BallConfig, PhysicsConfig, EnsembleConfig
-│       ├── terrain.py      # terrain generation + height/normal interpolation
-│       ├── simulation.py   # ball physics integration
-│       ├── analysis.py     # ensemble statistics, curve fits, roughness sweep
-│       ├── plotting.py     # all figures, as functions returning Figure objects
-│       └── cli.py          # `rough-slope-sim` command-line entry point
-├── tests/                  # pytest test suite
-├── examples/
-│   └── run_demo.py         # minimal end-to-end example script
-└── thesis_original/
-    └── thesis.py           # original, unmodified Colab export, kept for reference
-```
+## Configuration reference
 
-## Notes on the physical model
+All simulation parameters live in `config.py` as dataclasses:
 
-The ball is treated as a point mass with a fixed radius offset above the
-terrain surface. While in contact (`z <= terrain_height + radius`), gravity
-is split into a component normal to the local surface (balanced by the
-contact force) and a tangential component that accelerates the ball along
-the slope. If numerical integration causes the ball to dip below the
-surface within a step, its height is clamped back to the surface and the
-velocity component along the surface normal is reflected and scaled by
-`restitution_coeff` (`0` = fully inelastic / no bounce, `1` = perfectly
-elastic). Away from the surface, the ball is in free fall under gravity
-alone; a coarse free-flight step that would tunnel past the surface within
-a single `dt` is automatically redone with fine sub-stepping so the
-collision is still resolved accurately.
+| Class | Purpose |
+|---|---|
+| `TerrainConfig` | geometry (`ramp_length`, `slope_angle`, `length_y`), grid `resolution_x`/`resolution_y`, roughness (`grit_rough`/`grit_smooth` or explicit amplitudes), Galton peg parameters |
+| `BallConfig` | starting position/velocity, `radius`, `mass`, `restitution`, `friction_mu` |
+| `PhysicsConfig` | `gravity` |
+| `SimConfig` | `dt`, `t_max`, `save_interval`, `num_workers` |
+| `EnsembleConfig` | ensemble size and jitter for randomized starting positions |
+
+`TerrainConfig.z_offset` (default: auto-scaled to the ramp's own drop height)
+controls the baseline height of the plane before roughness is added — you
+normally don't need to touch it, but it's there if you do.
+
+## Known limitations / recent fixes
+
+- **Long-ramp terrain used to go flat.** The baseline plane's height offset
+  was a fixed constant that only worked by coincidence for ~29 cm ramps; on
+  longer ramps (e.g. the 600 cm plane in `run_long_sim.py`) the terrain was
+  silently clamped flat for most of its length. `z_offset` now auto-scales
+  with ramp length.
+- **`TerrainConfig.resolution_x`/`resolution_y` used to be ignored** — the
+  terrain always used a hardcoded 1000×1000 grid regardless of what you set.
+  This is now fixed; independent X/Y resolution is respected everywhere
+  (`TerrainConfig`, the CLI, and the `generate_calibrated_sandpaper`/
+  `generate_galton_board` convenience functions).
+- **Sandpaper Sa calibration** now uses real measured Nanovea Sa-vs-diameter
+  data instead of a flat `0.33 * d50` heuristic. Note the two Nanovea tables
+  in the codebase (the 11-grit d50 table and the 5-point Sa reference table)
+  don't fully agree with each other for the same nominal grit numbers — worth
+  reconciling against the full profilometry sheet if exact absolute values
+  matter for your comparison.
+- **`exploring_surfaces.py` is superseded.** Its grain-rendering scheme
+  (spacing, jitter, aspect ratio, real Sa calibration) has been folded into
+  `terrain.py`'s main grain generator. The script still works standalone but
+  duplicates a function name (`generate_calibrated_sandpaper`) with a
+  different signature than the package version — safe to archive/delete once
+  you've confirmed you don't need it as a reference.
+- Contact restitution below 5 cm/s of relative normal velocity is treated as
+  fully inelastic (anti-jitter smoothing) regardless of the configured
+  `restitution` — worth knowing if you're tuning bounce behavior for
+  slow-rolling contacts.
