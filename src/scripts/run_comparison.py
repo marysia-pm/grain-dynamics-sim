@@ -18,6 +18,7 @@ from rough_slope_sim import (
     BallConfig,
     EnsembleConfig,
     PhysicsConfig,
+    SimConfig,
     TerrainConfig,
     generate_terrain,
     run_ensemble_parallel,
@@ -147,6 +148,62 @@ def sample_hybrid_y0(
     return blend_factor * u_samples + (1.0 - blend_factor) * g_samples
 
 
+def load_alignment_params(
+    folder_or_file: str | Path, default_seam: float = 11.5, default_mech: float = 11.5
+) -> dict[str, float]:
+    """Reads experimental alignment metadata (mech_center_cm, seam_cm) from text files."""
+    params = {"seam_cm": default_seam, "mech_center_cm": default_mech, "has_seam": True}
+    if not folder_or_file:
+        return params
+
+    path = Path(folder_or_file)
+
+    # 1. Automatically redirect 'processing_results' to 'annotated_alignment_results'
+    if "processing_results" in path.parts:
+        parts = list(path.parts)
+        idx = parts.index("processing_results")
+        parts[idx] = "annotated_alignment_results"
+        target_path = Path(*parts)
+    else:
+        target_path = path
+
+    # 2. Search directory for matching annotation txt files
+    candidate_files: list[Path] = []
+    if target_path.is_dir():
+        candidates = set(target_path.glob("annotated_*.txt")) | set(target_path.glob("*sample_frame.txt"))
+        candidate_files = sorted(list(candidates))
+    elif target_path.exists():
+        candidate_files = [target_path]
+
+    if not candidate_files:
+        print(f"[ALIGN LOG] ⚠️ Metadata file not found in '{target_path}'. Using nominal defaults.")
+        return params
+
+    # 3. Read alignment parameters
+    for txt_path in candidate_files:
+        try:
+            df = pd.read_csv(txt_path, sep=r"\s+|\t|,", engine="python")
+
+            if "has_seam" in df.columns:
+                params["has_seam"] = str(df["has_seam"].iloc[0]).strip().lower() in ["true", "1"]
+
+            if params["has_seam"] and "seam_cm" in df.columns and pd.notna(df["seam_cm"].iloc[0]):
+                params["seam_cm"] = float(df["seam_cm"].iloc[0])
+
+            if "mech_center_cm" in df.columns and pd.notna(df["mech_center_cm"].iloc[0]):
+                params["mech_center_cm"] = float(df["mech_center_cm"].iloc[0])
+
+            print(
+                f"[ALIGN LOG] ✅ Loaded alignment from '{txt_path.name}': "
+                f"Release Y = {params['mech_center_cm']:.3f} cm | Seam Y = {params['seam_cm']:.3f} cm"
+            )
+            return params
+        except Exception as e:
+            print(f"[ALIGN LOG] ❌ Error parsing '{txt_path.name}': {e}. Using defaults.")
+
+    return params
+
+
 def process_folder(
     exp_folder: Path,
     out_root: Path,
@@ -157,6 +214,13 @@ def process_folder(
     folder_name = exp_folder.name
     cfg = parse_folder(folder_name)
 
+    # 1. Read measured seam position from metadata annotation file (defaults to 11.5 cm)
+    params = load_alignment_params(exp_folder)
+    has_seam = params["has_seam"]
+    seam_y = params["seam_cm"]
+    mech_center = params["mech_center_cm"]
+    print(has_seam, seam_y, mech_center)
+
     surface_info = (
         f"Dual Grit ({cfg.grit_left:.0f}P / {cfg.grit_right:.0f}P)"
         if cfg.is_dual
@@ -165,6 +229,9 @@ def process_folder(
 
     tqdm.write(f"\n[+] Processing Folder : {folder_name}")
     tqdm.write(f"  ├── Surface Config : {surface_info}")
+    if has_seam:
+        tqdm.write(f"  ├── Seam Position  : Y = {seam_y:.3f} cm")
+    tqdm.write(f"  ├── Entrainment Center  : Y = {mech_center:.3f} cm")
 
     sub_out = out_root / folder_name.replace("\\", "_").replace("/", "_")
     sub_out.mkdir(parents=True, exist_ok=True)
@@ -188,7 +255,7 @@ def process_folder(
         f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0 | Hybrid Y0 in [{y_min:.2f}, {y_max:.2f}] cm"
     )
 
-    # Construct TerrainConfig passing explicit grit values along with amplitudes
+    # 2. Construct TerrainConfig with dynamic seam boundary
     t_cfg = TerrainConfig(
         ramp_length=ramp_length_cm,
         slope_angle=slope_angle_deg,
@@ -196,7 +263,7 @@ def process_folder(
         roughness_amplitude_smooth=grit_to_amplitude(cfg.grit_right),
         grit_rough=cfg.grit_left,
         grit_smooth=cfg.grit_right,
-        roughness_transition_y=11.5,
+        roughness_transition_y=seam_y,
         seed=42,
     )
     terrain = generate_terrain(t_cfg)
@@ -209,11 +276,13 @@ def process_folder(
     physics_cfg = PhysicsConfig(gravity=981.0)
     e_cfg = EnsembleConfig(k_max=num_sim_balls, seed=42)
 
+    # 3. Explicitly pass sim_cfg and ensemble_cfg as keyword arguments
     sim_trajs = run_ensemble_parallel(
         terrain,
         ball_cfg,
         physics_cfg,
-        e_cfg,
+        sim_cfg=SimConfig(),
+        ensemble_cfg=e_cfg,
         initial_states=sampled_initial_states,
         show_progress=True,
         desc=f"  ├── Simulating ({num_sim_balls} balls)",
@@ -247,8 +316,15 @@ def process_folder(
     fig_hist.savefig(sub_out / "03_histogram_15cm.png", dpi=150, bbox_inches="tight")
     plt.close(fig_hist)
 
+    # 4. Render trajectory slice plot using the exact interface y-location
     fig_slices = plot_trajectories_and_three_slices(
-        exp_trajs, sim_trajs, X_SLICES, is_dual=cfg.is_dual, interface_y=11.5
+        exp_trajs,
+        sim_trajs,
+        X_SLICES,
+        is_dual=cfg.is_dual,
+        interface_y=seam_y,
+        terrain=terrain,
+        ball_radius=ball_cfg.radius,
     )
     fig_slices.savefig(sub_out / "04_trajectories_and_3slices.png", dpi=150, bbox_inches="tight")
     plt.close(fig_slices)
@@ -260,6 +336,7 @@ def process_folder(
     return {
         "folder": folder_name,
         "is_dual": cfg.is_dual,
+        "seam_y_cm": seam_y,
         "slope_angle_deg": slope_angle_deg,
         "x_max_proj_cm": x_max_proj,
         "exp_start_y_min": y_min,

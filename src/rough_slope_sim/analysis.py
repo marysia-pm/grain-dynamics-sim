@@ -25,14 +25,18 @@ def trajectories_at_x_slice(
         if x_arr is None or len(x_arr) < 2:
             continue
 
-        if not np.all(x_arr[:-1] <= x_arr[1:]):
-            sort_idx = np.argsort(x_arr)
-            x_sorted, y_sorted = x_arr[sort_idx], y_arr[sort_idx]
-        else:
-            x_sorted, y_sorted = x_arr, y_arr
+        # Fix 3: Find first passage crossing without breaking trajectory time ordering
+        crossings = np.where((x_arr[:-1] <= x_slice) & (x_arr[1:] >= x_slice))[0]
+        if len(crossings) > 0:
+            idx = crossings[0]
+            x1, x2 = x_arr[idx], x_arr[idx + 1]
+            y1, y2 = y_arr[idx], y_arr[idx + 1]
 
-        if x_sorted[0] <= x_slice <= x_sorted[-1]:
-            y_interp_list.append(np.interp(x_slice, x_sorted, y_sorted))
+            if x2 != x1:
+                y_interp = y1 + (y2 - y1) * (x_slice - x1) / (x2 - x1)
+            else:
+                y_interp = y1
+            y_interp_list.append(y_interp)
 
     return np.array(y_interp_list, dtype=np.float64)
 

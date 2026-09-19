@@ -57,27 +57,25 @@ def run_simulation(
     phys_cfg: PhysicsConfig,
     sim_cfg: SimConfig,
 ) -> TrajectoryRecord:
-    """Integrates 3D motion of a sphere bouncing/sliding over rough terrain
-    under plain vertical gravity, using restitution-based collision response.
-    """
     dt = float(getattr(sim_cfg, "dt", 5e-4))
     t_max = float(getattr(sim_cfg, "t_max", 2.0))
     save_interval = int(getattr(sim_cfg, "save_interval", 10))
 
     r = float(ball_cfg.radius)
-    e = float(getattr(ball_cfg, "restitution", 0.3))
+    e = float(getattr(ball_cfg, "restitution", 0.7))
     mu = float(getattr(ball_cfg, "friction_mu", 0.0))
 
     x = float(getattr(ball_cfg, "x0", 0.1))
     y = float(getattr(ball_cfg, "y0", 11.5))
 
-    z_rest = float(terrain.get_height(x, y)) + r
+    # Fix 1: Compute true surface normal offset at spawn
+    nx0, ny0, nz0 = terrain.get_normal(x, y)
+    z_rest = float(terrain.get_height(x, y)) + (r / max(nz0, 1e-6))
     z = float(ball_cfg.z0) if ball_cfg.z0 is not None else z_rest
 
     vx, vy, vz = float(ball_cfg.vx0), float(ball_cfg.vy0), float(ball_cfg.vz0)
-
     g = float(getattr(phys_cfg, "gravity", getattr(phys_cfg, "g", 981.0)))
-    gz = -g  # gravity always points straight down in world coordinates
+    gz = -g
 
     x_min, x_max = terrain.x_bounds
     y_min, y_max = terrain.y_bounds
@@ -113,25 +111,20 @@ def run_simulation(
             tz_hist[rec_idx] = float(terrain.get_height(x, y))
             rec_idx += 1
 
-        # 1. Free-fall / unconstrained integration under plain vertical gravity.
         vz += gz * dt
         x += vx * dt
         y += vy * dt
         z += vz * dt
 
-        # 2. Collision detection & response against the surface at the new (x, y).
         z_surf = float(terrain.get_height(x, y))
         dz_dx, dz_dy = terrain.get_gradient(x, y)
         n_raw = np.array([-float(dz_dx), -float(dz_dy), 1.0], dtype=np.float64)
         n = n_raw / np.linalg.norm(n_raw)
 
-        # Perpendicular distance from the ball center to the surface,
-        # approximated by projecting the vertical gap onto the normal.
         dist_to_surface = (z - z_surf) * n[2]
         penetration = r - dist_to_surface
 
         if penetration > 0:
-            # Snap back onto the surface along the normal.
             x += penetration * n[0]
             y += penetration * n[1]
             z += penetration * n[2]
@@ -140,7 +133,11 @@ def run_simulation(
             v_normal = np.dot(v_vec, n)
 
             if v_normal < 0.0:
-                v_vec = v_vec - (1.0 + e) * v_normal * n
+                # Fix 2: Smooth contact transition threshold (5.0 cm/s) to prevent chattering
+                if abs(v_normal) < 5.0:
+                    v_vec = v_vec - v_normal * n
+                else:
+                    v_vec = v_vec - (1.0 + e) * v_normal * n
 
             if mu > 0.0:
                 v_n_component = np.dot(v_vec, n) * n
@@ -179,6 +176,11 @@ def simulate_single_ball(
 ) -> TrajectoryRecord:
     if sim_cfg is None:
         sim_cfg = SimConfig()
+    # Contact uses the ball-radius rolling envelope, not the raw terrain -- a
+    # finite-size ball can't feel geometric detail sharper than its own contact
+    # patch (see Terrain.get_contact_terrain / compute_rolling_ball_envelope).
+    if hasattr(terrain, "get_contact_terrain"):
+        terrain = terrain.get_contact_terrain(ball_cfg.radius)
     return run_simulation(terrain, ball_cfg, phys_cfg, sim_cfg)
 
 
@@ -209,15 +211,18 @@ def run_ensemble_parallel(
     show_progress: bool = False,
     desc: str | None = None,
 ) -> list[TrajectoryRecord]:
-    """Runs an ensemble of balls in parallel.
-
-    Initial (x0, y0, vx0, vy0) states come from `initial_states` if given,
-    otherwise are jittered from `ensemble_cfg`, otherwise a single run at
-    `ball_cfg`'s own initial state. Per-ball radius/mass/restitution/friction
-    come from `ball_cfg`; only position/velocity are overridden per run.
-    """
+    """Runs an ensemble of balls in parallel."""
     if sim_cfg is None:
         sim_cfg = SimConfig()
+
+    # Contact uses the ball-radius rolling envelope, not the raw terrain -- a
+    # finite-size ball can't feel geometric detail sharper than its own contact
+    # patch (see Terrain.get_contact_terrain / compute_rolling_ball_envelope).
+    # Computed ONCE here (it's cached on the terrain instance anyway) so every
+    # worker/ball reuses the same precomputed envelope instead of recomputing
+    # an expensive dilation per ball.
+    if hasattr(terrain, "get_contact_terrain"):
+        terrain = terrain.get_contact_terrain(ball_cfg.radius)
 
     if initial_states is not None:
         states = list(initial_states)

@@ -11,6 +11,7 @@ def measure_and_draw_incline_angle(
     show_plot: bool = True,
 ):
     """Measures the angle between an inclined surface and the ground for a single image."""
+
     img_path = Path(image_path)
     img = cv2.imread(str(img_path))
     if img is None:
@@ -68,6 +69,7 @@ def measure_and_draw_incline_angle(
     y_ground = y_apex
 
     # 4. Visualization & Annotation
+    plt.style.use("https://raw.githubusercontent.com/turczyneq/softmatter-style/main/softmatter.mplstyle")
     fig, ax = plt.subplots(figsize=(10, 12), dpi=150)
     ax.imshow(img_rgb)
 

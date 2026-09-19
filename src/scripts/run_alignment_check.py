@@ -1,4 +1,6 @@
+import re
 from pathlib import Path
+
 import cv2
 import matplotlib
 
@@ -22,33 +24,42 @@ def analyze_and_visualize_alignment(
     h, w, _ = img.shape
     px_per_cm = w / board_width_cm
 
-    # Check if this image folder requires seam detection
+    # 1. Flexible Folder Pattern Matching for Seam Detection
     normalized_path = image_path.as_posix()
-    has_seam = ("120/400" in normalized_path) or ("400/80" in normalized_path)
+    seam_pattern = re.compile(r"(120[^\d]*400|400[^\d]*80)", re.IGNORECASE)
+    path_has_seam = bool(seam_pattern.search(normalized_path))
 
-    # 1. Geometric Frame Center
+    # 2. Geometric Frame Center
     frame_center_x = w / 2.0
     frame_center_cm = frame_center_x / px_per_cm
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2. Detect Surface Seam Line (Conditional)
+    # 3. Detect Surface Seam Line (Gradient Analysis)
+    mid_strip = gray[int(h * 0.2) : int(h * 0.8), :]
+
+    # Gaussian blur removes individual sand grain noise
+    blurred = cv2.GaussianBlur(mid_strip, (15, 15), 0)
+    grad_x = np.abs(cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3))
+    profile = grad_x.mean(axis=0)
+
+    search_range = range(int(w * 0.25), int(w * 0.75))
+    max_grad_val = np.max(profile[search_range])
+
+    # Seam exists if path matches pattern OR if a strong gradient boundary is present
+    has_seam = path_has_seam or (max_grad_val > 15.0)
+
     seam_x = None
     seam_cm = None
     offset_seam_frame_mm = None
     offset_mech_seam_mm = None
 
     if has_seam:
-        mid_strip = gray[int(h * 0.2) : int(h * 0.8), :]
-        grad_x = np.abs(cv2.Sobel(mid_strip, cv2.CV_64F, 1, 0, ksize=3))
-        profile = grad_x.mean(axis=0)
-
-        search_range = range(int(w * 0.35), int(w * 0.65))
         seam_x = search_range[np.argmax(profile[search_range])]
         seam_cm = seam_x / px_per_cm
         offset_seam_frame_mm = (seam_cm - frame_center_cm) * 10.0
 
-    # 3. Detect White Entrainer Center
+    # 4. Detect White Entrainer Center
     top_strip = gray[0 : int(h * 0.03), :]
     bright_cols = np.where(top_strip.max(axis=0) > 120)[0]
     bright_cols_center = [c for c in bright_cols if c > int(w * 0.2)]
@@ -61,12 +72,13 @@ def analyze_and_visualize_alignment(
     mech_center_x = (white_left + white_right) / 2.0
     mech_center_cm = mech_center_x / px_per_cm
 
-    # 4. Calculate Offsets (mm)
+    # 5. Calculate Offsets (mm)
     offset_mech_frame_mm = (mech_center_cm - frame_center_cm) * 10.0
     if has_seam:
         offset_mech_seam_mm = (mech_center_cm - seam_cm) * 10.0
 
     # Plotting
+    plt.style.use("https://raw.githubusercontent.com/turczyneq/softmatter-style/main/softmatter.mplstyle")
     fig, ax = plt.subplots(figsize=(10, 12), dpi=150)
     ax.imshow(img_rgb)
 
@@ -105,8 +117,8 @@ def analyze_and_visualize_alignment(
     )
 
     # Offset connection arrow when shifted
-    if has_seam and abs(offset_mech_seam_mm) > 1.0:
-        y_arrow = int(h * 0.12)
+    y_arrow = int(h * 0.12)
+    if has_seam and abs(offset_mech_seam_mm) > 0.5:
         ax.annotate(
             "",
             xy=(seam_x, y_arrow),
@@ -123,8 +135,7 @@ def analyze_and_visualize_alignment(
             ha="center",
             bbox=dict(boxstyle="square,pad=0.2", fc="black", ec="none", alpha=0.7),
         )
-    elif not has_seam and abs(offset_mech_frame_mm) > 1.0:
-        y_arrow = int(h * 0.12)
+    elif not has_seam and abs(offset_mech_frame_mm) > 0.5:
         ax.annotate(
             "",
             xy=(frame_center_x, y_arrow),
@@ -158,7 +169,7 @@ def analyze_and_visualize_alignment(
         0.02,
         "\n".join(info_lines),
         transform=ax.transAxes,
-        fontsize=18,
+        fontsize=16,
         verticalalignment="bottom",
         bbox=dict(boxstyle="round,pad=0.5", facecolor="black", alpha=0.8, edgecolor="white"),
         color="white",
