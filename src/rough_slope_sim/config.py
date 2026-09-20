@@ -10,7 +10,7 @@ import numpy as np
 class TerrainConfig:
     """Geometry, roughness, and peg parameters for slope terrains."""
 
-    surface_type: str = "sandpaper"  # "flat", "sandpaper" or "galton"
+    surface_type: str = "sandpaper"  # "sandpaper" or "galton"
     ramp_length: float = 29.0  # physical ramp length (cm)
     slope_angle: float = 30.0  # incline angle in degrees
     length_y: float = 23.0  # ramp width (cm)
@@ -64,8 +64,8 @@ class BallConfig:
     vy0: float = 0.0
     vz0: float = 0.0
     radius: float = 0.125  # cm
-    mass: float = 1.0  # g
-    restitution: float = 0.7
+    mass: float = 0.02  # g
+    restitution: float = 0.5
     friction_mu: float = 0.0
 
 
@@ -85,7 +85,7 @@ class SimConfig:
     """Simulation time-stepping and execution options."""
 
     dt: float = 5e-4
-    t_max: float = 5.0
+    t_max: float = 2.0
     save_interval: int = 10
     num_workers: int = 4
     seed: int | None = 42

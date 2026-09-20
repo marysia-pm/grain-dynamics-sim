@@ -401,7 +401,7 @@ def plot_ball_surface_closeup(
     return fig
 
 
-def plot_terrain_3d(terrain: Terrain, *, quiver_skip: int = 1000) -> Figure:
+def plot_terrain_3d(terrain: Terrain, *, quiver_skip: int = 28) -> Figure:
     """Generates 3D surface plot over the entire surface with sparse surface normal vectors."""
     fig = plt.figure(figsize=(9, 6))
     ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
@@ -538,6 +538,50 @@ def plot_experiment_vs_sim_distribution(
     return fig
 
 
+def _fit_bimodal_gaussian(
+    data: np.ndarray, init_split: float | None = None, n_iter: int = 50
+) -> tuple[float, float, float, float, float, float]:
+    """Fits a two-component 1D Gaussian mixture via EM (no sklearn dependency).
+
+    `init_split` seeds the two components from data on either side of that
+    value (e.g. the rough/smooth interface_y) rather than an arbitrary median
+    split -- a much better starting point when the bimodality is expected to
+    line up with a known physical boundary, as it does for a dual-grit
+    surface. Falls back to splitting the sorted data in half if either side
+    of `init_split` has too few points to seed a component.
+
+    Returns (w1, mu1, sigma1, w2, mu2, sigma2).
+    """
+    data = np.asarray(data, dtype=np.float64)
+    split = init_split if init_split is not None else float(np.median(data))
+    g1, g2 = data[data < split], data[data >= split]
+    if len(g1) < 2 or len(g2) < 2:
+        sorted_data = np.sort(data)
+        mid = len(sorted_data) // 2
+        g1, g2 = sorted_data[:mid], sorted_data[mid:]
+
+    mu1, sigma1 = float(np.mean(g1)), max(float(np.std(g1)), 1e-3)
+    mu2, sigma2 = float(np.mean(g2)), max(float(np.std(g2)), 1e-3)
+    w1, w2 = len(g1) / len(data), len(g2) / len(data)
+
+    for _ in range(n_iter):
+        p1 = w1 * norm.pdf(data, mu1, sigma1)
+        p2 = w2 * norm.pdf(data, mu2, sigma2)
+        total = p1 + p2
+        total[total <= 0] = 1e-300
+        r1, r2 = p1 / total, p2 / total
+
+        N1, N2 = r1.sum(), r2.sum()
+        if N1 < 1e-6 or N2 < 1e-6:
+            break
+        mu1, mu2 = np.sum(r1 * data) / N1, np.sum(r2 * data) / N2
+        sigma1 = max(np.sqrt(np.sum(r1 * (data - mu1) ** 2) / N1), 1e-3)
+        sigma2 = max(np.sqrt(np.sum(r2 * (data - mu2) ** 2) / N2), 1e-3)
+        w1, w2 = N1 / len(data), N2 / len(data)
+
+    return w1, mu1, sigma1, w2, mu2, sigma2
+
+
 def plot_trajectories_and_three_slices(
     exp_trajs: list,
     sim_trajs: list,
@@ -624,15 +668,28 @@ def plot_trajectories_and_three_slices(
         if is_last:
             for valid, color, label in [(valid_e, "#0d47a1", "Exp"), (valid_s, "#ff6f00", "Sim")]:
                 if len(valid) > 2 and np.std(valid) > 1e-9:
-                    mu, sigma = norm.fit(valid)
                     grid = np.linspace(*shared_xlim, 200)
-                    ax_slice.plot(
-                        grid,
-                        norm.pdf(grid, mu, sigma),
-                        color=color,
-                        lw=2.0,
-                        label=rf"{label} fit: $\mu$={mu:.2f}, $\sigma$={sigma:.2f}",
-                    )
+                    if is_dual and len(valid) >= 10:
+                        # A dual-grit surface has two different roughnesses either
+                        # side of the interface, so the downstream Y-distribution
+                        # is naturally two-humped rather than a single Gaussian --
+                        # seed the fit at the known interface for a good start.
+                        w1, mu1, s1, w2, mu2, s2 = _fit_bimodal_gaussian(valid, init_split=interface_y)
+                        pdf = w1 * norm.pdf(grid, mu1, s1) + w2 * norm.pdf(grid, mu2, s2)
+                        fit_label = (
+                            rf"{label} bimodal: $\mu_1$={mu1:.2f} ($w_1$={w1:.2f}), "
+                            rf"$\mu_2$={mu2:.2f} ($w_2$={w2:.2f})"
+                        )
+                        ax_slice.plot(grid, pdf, color=color, lw=2.0, label=fit_label)
+                    else:
+                        mu, sigma = norm.fit(valid)
+                        ax_slice.plot(
+                            grid,
+                            norm.pdf(grid, mu, sigma),
+                            color=color,
+                            lw=2.0,
+                            label=rf"{label} fit: $\mu$={mu:.2f}, $\sigma$={sigma:.2f}",
+                        )
 
         if is_dual:
             ax_slice.axvline(interface_y, color="black", linestyle="-.", lw=1.2)
@@ -656,6 +713,63 @@ def plot_variance_over_time(time_axis: np.ndarray, variance: np.ndarray) -> Figu
     ax.set_title("Ensemble Lateral Variance Over Time", fontweight="bold", pad=12)
     ax.set_xlabel("Time (s)", fontweight="bold")
     ax.set_ylabel("Var(Y) (cm$^2$)", fontweight="bold")
+    ax.grid(True, linestyle=":", alpha=0.6)
+    plt.tight_layout()
+    return fig
+
+
+def plot_count_by_side_over_time(
+    time_axis: np.ndarray,
+    n_rough: np.ndarray,
+    n_smooth: np.ndarray,
+    n_active: np.ndarray | None = None,
+    interface_y: float | None = None,
+) -> Figure:
+    """Plots how many balls are currently on each side of the rough/smooth
+    interface over time -- one side falling while the other rises is the
+    signature of a net flux of particles crossing between the two textures.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(time_axis, n_rough, color="#8d5524", lw=2.0, label="Rough side")
+    ax.plot(time_axis, n_smooth, color="#1e88e5", lw=2.0, label="Smooth side")
+    if n_active is not None:
+        ax.plot(time_axis, n_active, color="gray", lw=1.2, linestyle=":", label="Total active")
+    ax.set_xlabel("Time (s)", fontweight="bold")
+    ax.set_ylabel("Number of balls", fontweight="bold")
+    title = "Ball Count by Surface Side Over Time"
+    if interface_y is not None:
+        title += f" (interface at Y={interface_y:.1f} cm)"
+    ax.set_title(title, fontweight="bold", pad=12)
+    ax.legend(loc="best")
+    ax.grid(True, linestyle=":", alpha=0.6)
+    plt.tight_layout()
+    return fig
+
+
+def plot_variance_by_side_over_time(
+    time_axis: np.ndarray,
+    var_rough: np.ndarray,
+    var_smooth: np.ndarray,
+    D_rough: float | None = None,
+    D_smooth: float | None = None,
+) -> Figure:
+    """Plots Y-position variance over time, computed separately among whichever
+    balls are currently on each side of the interface -- shows directly
+    whether one side's spread is growing faster than the other's. If given,
+    D_rough/D_smooth (from estimate_diffusion_from_variance_slope) are shown in
+    the legend as apparent/effective values -- see that function's docstring
+    for why these are a biased approximation, not a rigorous measurement, of
+    each side's true local diffusivity.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    label_r = "Rough side" + (f" (apparent D={D_rough:.3f} cm$^2$/s)" if D_rough is not None else "")
+    label_s = "Smooth side" + (f" (apparent D={D_smooth:.3f} cm$^2$/s)" if D_smooth is not None else "")
+    ax.plot(time_axis, var_rough, color="#8d5524", lw=2.0, label=label_r)
+    ax.plot(time_axis, var_smooth, color="#1e88e5", lw=2.0, label=label_s)
+    ax.set_xlabel("Time (s)", fontweight="bold")
+    ax.set_ylabel("Var(Y) (cm$^2$)", fontweight="bold")
+    ax.set_title("Lateral Position Variance by Surface Side", fontweight="bold", pad=12)
+    ax.legend(loc="best")
     ax.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()
     return fig

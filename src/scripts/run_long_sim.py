@@ -64,7 +64,7 @@ def main():
     except Exception:
         plt.style.use("seaborn-v0_8-whitegrid")
 
-    plane_length = 90.0
+    plane_length = 600.0
     plane_width = 30.0
     seam_y = 15.0
 
@@ -73,7 +73,7 @@ def main():
         ramp_length=plane_length,
         slope_angle=30.0,
         length_y=plane_width,
-        resolution_x=450,
+        resolution_x=2400,
         resolution_y=150,
         grit_rough=80.0,
         grit_smooth=120.0,
@@ -92,10 +92,10 @@ def main():
     )
 
     ensemble_cfg = EnsembleConfig(
-        k_max=300,
-        start_x=0.1,
+        k_max=200,
+        start_x=0.0,
         start_y=seam_y,
-        x_jitter_std=0.1,
+        x_jitter_std=0.0,
         y_jitter_max=0.1,
         seed=42,
     )
@@ -140,7 +140,7 @@ def main():
         color = "#1e88e5"
         ax_main.plot(y_arr, x_arr, color=color, alpha=0.35, linewidth=0.8)
 
-    slice_x_vals = [0.1, 10.0, 80.0]
+    slice_x_vals = [0.0, 100.0, 500.0]
     ax_main.axhline(
         slice_x_vals[0],
         color=c_slice1,

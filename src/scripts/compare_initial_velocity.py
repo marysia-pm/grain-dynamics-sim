@@ -171,7 +171,9 @@ def main():
     ax_main.axhline(slice_x_vals[1], color=c_slice2, linestyle="--", linewidth=1.5, label="Slice X=10.0 cm")
     ax_main.axhline(slice_x_vals[2], color=c_slice3, linestyle="--", linewidth=1.5, label="Slice X=15.0 cm")
 
-    ax_main.set_title("Trajectories (Rotated 90° CW: Downslope Downwards)", fontsize=11, fontweight="bold")
+    ax_main.set_title(
+        r"Trajectories (Rotated $90^\circ$ CW: Downslope Downwards)", fontsize=11, fontweight="bold"
+    )
     ax_main.set_xlabel("Y Position (cm) [Lateral]", fontsize=10)
     ax_main.set_ylabel("X Position (cm) [Downslope]", fontsize=10)
 

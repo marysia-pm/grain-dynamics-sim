@@ -31,20 +31,20 @@ from rough_slope_sim.plotting import (
     plot_trajectories_and_three_slices,
 )
 
-X_SLICES = [3.0, 7.0, 10.0]
+X_SLICES = [5.0, 10.0, 15.0]
 CLOSEUP_X, CLOSEUP_Y = 5.0, 11.5
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Galton Board Simulation and Export 5 Key Plots")
-    parser.add_argument("--out-dir", type=Path, default=Path("output/smooth"), help="Output directory")
-    parser.add_argument("--num-balls", type=int, default=20, help="Number of simulated balls")
+    parser.add_argument("--out-dir", type=Path, default=Path("output/galton"), help="Output directory")
+    parser.add_argument("--num-balls", type=int, default=150, help="Number of simulated balls")
     parser.add_argument("--slope-angle", type=float, default=20.0, help="Slope angle (degrees)")
     parser.add_argument("--ramp-length", type=float, default=29.0, help="Physical ramp length (cm)")
-    parser.add_argument("--peg-radius", type=float, default=0.5, help="Peg radius (cm)")
-    parser.add_argument("--peg-height", type=float, default=0.0, help="Peg height (cm)")
-    parser.add_argument("--peg-dx", type=float, default=100, help="Peg X spacing (cm)")
-    parser.add_argument("--peg-dy", type=float, default=100, help="Peg Y spacing (cm)")
+    parser.add_argument("--peg-radius", type=float, default=0.45, help="Peg radius (cm)")
+    parser.add_argument("--peg-height", type=float, default=2.0, help="Peg height (cm)")
+    parser.add_argument("--peg-dx", type=float, default=2.0, help="Peg X spacing (cm)")
+    parser.add_argument("--peg-dy", type=float, default=2.0, help="Peg Y spacing (cm)")
     parser.add_argument(
         "--peg-shape", type=str, default="cylinder", choices=["paraboloid", "gaussian", "cylinder"]
     )
@@ -71,7 +71,7 @@ def main() -> None:
         peg_dx=args.peg_dx,
         peg_dy=args.peg_dy,
         peg_shape=args.peg_shape,
-        seed=10,
+        seed=42,
     )
     terrain = generate_terrain(t_cfg)
 
@@ -79,11 +79,11 @@ def main() -> None:
     rng = np.random.default_rng(42)
     y_min, y_max = 11.5, 11.5
     y0_vals = rng.uniform(y_min, y_max, size=args.num_balls)
-    initial_states = [(0.15, float(y0), 0.0, 0.0) for y0 in y0_vals]
+    initial_states = [(0.1, float(y0), 0.0, 0.0) for y0 in y0_vals]
 
     ball_cfg = BallConfig(radius=0.125, x0=0.1)
     physics_cfg = PhysicsConfig(gravity=981.0)
-    e_cfg = EnsembleConfig(k_max=args.num_balls, x_jitter_std=0.0, y_jitter_max=0, seed=42)
+    e_cfg = EnsembleConfig(k_max=args.num_balls, x_jitter_std=0, y_jitter_max=0, seed=42)
     print(e_cfg)
     # 3. Parallel Simulation Run
     sim_trajs = run_ensemble_parallel(
@@ -113,30 +113,30 @@ def main() -> None:
 
     # Image 2: 3D Terrain with Surface Normals
     fig_terrain = plot_terrain_3d(terrain, quiver_skip=28)
-    fig_terrain.savefig(out_dir / "01_terrain_3d_normals.png", dpi=300, bbox_inches="tight")
+    fig_terrain.savefig(out_dir / "01_terrain_3d_normals.png", dpi=150, bbox_inches="tight")
     plt.close(fig_terrain)
 
     # Image 3: 3D Trajectory Ensemble
     fig_traj3d = plot_trajectories_3d(terrain, sim_trajs)
-    fig_traj3d.savefig(out_dir / "02_terrain_trajectories_3d.png", dpi=300, bbox_inches="tight")
+    fig_traj3d.savefig(out_dir / "02_terrain_trajectories_3d.png", dpi=150, bbox_inches="tight")
     plt.close(fig_traj3d)
 
-    # Image 4: Density Distribution Histogram at X = 11 cm
+    # Image 4: Density Distribution Histogram at X = 15 cm
     y_sim_15 = trajectories_at_x_slice(sim_trajs, 15.0)
     fig_hist = plot_experiment_vs_sim_distribution(
-        [], y_sim_15, x_slice=15.0, title="Galton Board Density (X = 11.0 cm)"
+        [], y_sim_15, x_slice=15.0, title="Galton Board Density (X = 15.0 cm)"
     )
-    fig_hist.savefig(out_dir / "03_histogram_15cm.png", dpi=300, bbox_inches="tight")
+    fig_hist.savefig(out_dir / "03_histogram_15cm.png", dpi=150, bbox_inches="tight")
     plt.close(fig_hist)
 
     # Image 5: 90° CW Rotated Trajectories and 3-Slice Profiles
     fig_slices = plot_trajectories_and_three_slices(
         [], sim_trajs, X_SLICES, is_dual=False, terrain=terrain, ball_radius=ball_cfg.radius
     )
-    fig_slices.savefig(out_dir / "04_trajectories_and_3slices.png", dpi=300, bbox_inches="tight")
+    fig_slices.savefig(out_dir / "04_trajectories_and_3slices.png", dpi=150, bbox_inches="tight")
     plt.close(fig_slices)
 
-    diff_coeff = calculate_diffusion_coefficient(y_sim_15, x_slice=11.0)
+    diff_coeff = calculate_diffusion_coefficient(y_sim_15, x_slice=15.0)
     print(f"[✓] Completed successfully! Saved 5 plots to '{out_dir}'.")
     print(f"    └── Lateral Diffusion Coefficient D_sim = {diff_coeff:.4f} cm²/s\n")
 

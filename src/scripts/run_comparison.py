@@ -26,18 +26,24 @@ from rough_slope_sim import (
 from rough_slope_sim.analysis import (
     calculate_diffusion_coefficient,
     compare_distributions,
+    count_on_side_over_time,
+    estimate_diffusion_from_variance_slope,
+    local_diffusion_coefficient_from_increments,
     trajectories_at_x_slice,
+    variance_over_time_by_side,
 )
 from rough_slope_sim.plotting import (
     plot_ball_surface_closeup,
+    plot_count_by_side_over_time,
     plot_experiment_vs_sim_distribution,
     plot_terrain_3d,
     plot_trajectories_3d,
     plot_trajectories_and_three_slices,
+    plot_variance_by_side_over_time,
 )
 from rough_slope_sim.terrain import nanovea_d50_from_grit
 
-PX_TO_CM = 0.01185
+PX_TO_CM = 0.01123
 X_SLICES = [5.0, 10.0, 15.0]
 CLOSEUP_X, CLOSEUP_Y = 5.0, 15.0
 
@@ -130,20 +136,24 @@ def load_trajectories(folder: Path, ramp_length_proj_cm: float, target_x0: float
 
 
 def sample_hybrid_y0(
-    y_min: float,
-    y_max: float,
+    center_y: float,
+    std_y: float,
     num_samples: int,
     seed: int = 42,
-    blend_factor: float = 0.5,
+    blend_factor: float = 0.05,
 ) -> np.ndarray:
+    """
+    Samples initial Y positions anchored to the entrainment center (mech_center).
+    """
     rng = np.random.default_rng(seed)
 
-    u_samples = rng.uniform(y_min, y_max, size=num_samples)
+    # Gaussian distribution centered ON the entrainment center
+    g_samples = rng.normal(loc=center_y, scale=std_y, size=num_samples)
 
-    y_mid = (y_min + y_max) / 2.0
-    y_std = (y_max - y_min) / 4.0
-    g_samples = rng.normal(y_mid, y_std, size=num_samples)
-    g_samples = np.clip(g_samples, y_min, y_max)
+    # Small uniform spread across physical launcher boundaries (+/- 3 std)
+    u_min = center_y - 3.0 * std_y
+    u_max = center_y + 3.0 * std_y
+    u_samples = rng.uniform(u_min, u_max, size=num_samples)
 
     return blend_factor * u_samples + (1.0 - blend_factor) * g_samples
 
@@ -243,17 +253,31 @@ def process_folder(
         tqdm.write("  └── [!] No valid trajectories found. Skipping.")
         return None
 
-    exp_y_starts = [t[0, 2] for t in exp_trajs if len(t) > 0]
-    y_min, y_max = float(np.min(exp_y_starts)), float(np.max(exp_y_starts))
+    exp_y_starts = np.array([t[0, 2] for t in exp_trajs if len(t) > 0])
+    exp_mean_y = float(np.mean(exp_y_starts))
+    std_y = float(np.std(exp_y_starts)) if len(exp_y_starts) > 1 else 0.10
+
+    # Sanity check: If mech_center deviates by > 0.5 cm from actual tracked tracks,
+    # use empirical experimental center to prevent metadata misdetection issues.
+    if abs(mech_center - exp_mean_y) > 0.5:
+        tqdm.write(
+            f"  ├── [!] WARNING: mech_center ({mech_center:.3f} cm) disagrees with "
+            f"exp tracks mean ({exp_mean_y:.3f} cm). Using exp mean for sim center."
+        )
+        sim_center_y = exp_mean_y
+    else:
+        sim_center_y = mech_center
 
     num_sim_balls = max(len(exp_trajs), 150)
-    sim_y0_vals = sample_hybrid_y0(y_min, y_max, num_samples=num_sim_balls)
-    sampled_initial_states = [(0.1, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
-
-    tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories (X release aligned to 0.1 cm)")
-    tqdm.write(
-        f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0 | Hybrid Y0 in [{y_min:.2f}, {y_max:.2f}] cm"
+    sim_y0_vals = sample_hybrid_y0(
+        center_y=sim_center_y,
+        std_y=std_y,
+        num_samples=num_sim_balls,
+        blend_factor=0.05,
     )
+    sampled_initial_states = [(0.1, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
+    tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories (X release aligned to 0.1 cm)")
+    tqdm.write(f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0] cm")
 
     # 2. Construct TerrainConfig with dynamic seam boundary
     t_cfg = TerrainConfig(
@@ -333,16 +357,60 @@ def process_folder(
     d_sim = calculate_diffusion_coefficient(y_sim_15, x_slice=15.0)
     metrics = compare_distributions(y_exp_15, y_sim_15)
 
+    d_rough_apparent = np.nan
+    d_smooth_apparent = np.nan
+    d_rough_local = np.nan
+    d_smooth_local = np.nan
+    if cfg.is_dual:
+        # These plots/metrics only make sense for a dual-grit surface with an
+        # actual rough/smooth interface. Flux plot: does one side's ball count
+        # fall while the other's rises (net migration across the interface)?
+        t_axis, n_rough, n_smooth, n_active = count_on_side_over_time(sim_trajs, interface_y=seam_y)
+        fig_flux = plot_count_by_side_over_time(t_axis, n_rough, n_smooth, n_active, interface_y=seam_y)
+        fig_flux.savefig(sub_out / "05_flux_by_side.png", dpi=300, bbox_inches="tight")
+        plt.close(fig_flux)
+
+        # local_diffusion_coefficient_from_increments is the primary, accurate
+        # metric (Kramers-Moyal second moment, conditioned on each increment's
+        # own starting position -- confirmed <1% error on synthetic ground
+        # truth at lag_steps=1). Use this number for actual comparisons.
+        local_D = local_diffusion_coefficient_from_increments(sim_trajs, interface_y=seam_y, lag_steps=1)
+        d_rough_local = local_D["D_rough"]
+        d_smooth_local = local_D["D_smooth"]
+
+        # variance_over_time_by_side + estimate_diffusion_from_variance_slope
+        # give an "apparent" D from long-time population variance -- kept here
+        # only for the visual plot (does one side's spread visibly grow
+        # faster), NOT as a quantitative value: it's biased low on both sides
+        # (see that function's docstring) because the current-side population
+        # mixes different crossing histories, unlike the per-increment method
+        # above which conditions on each increment's own starting position.
+        t_axis2, var_r, var_s, n_r2, n_s2 = variance_over_time_by_side(sim_trajs, interface_y=seam_y)
+        d_rough_apparent = estimate_diffusion_from_variance_slope(t_axis2, var_r)
+        d_smooth_apparent = estimate_diffusion_from_variance_slope(t_axis2, var_s)
+        fig_var_side = plot_variance_by_side_over_time(
+            t_axis2, var_r, var_s, d_rough_apparent, d_smooth_apparent
+        )
+        fig_var_side.savefig(sub_out / "06_variance_by_side.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_var_side)
+
+        tqdm.write(
+            f"  ├── D_rough={d_rough_local:.4f}, D_smooth={d_smooth_local:.4f} cm\u00b2/s "
+            f"(Kramers-Moyal, lag_steps=1)"
+        )
+
     return {
         "folder": folder_name,
         "is_dual": cfg.is_dual,
         "seam_y_cm": seam_y,
         "slope_angle_deg": slope_angle_deg,
         "x_max_proj_cm": x_max_proj,
-        "exp_start_y_min": y_min,
-        "exp_start_y_max": y_max,
         "D_exp_cm2_s": d_exp,
         "D_sim_cm2_s": d_sim,
+        "D_rough_cm2_s": d_rough_local,
+        "D_smooth_cm2_s": d_smooth_local,
+        "D_rough_apparent_cm2_s": d_rough_apparent,
+        "D_smooth_apparent_cm2_s": d_smooth_apparent,
         "wasserstein_cm": metrics["wasserstein_distance"],
         "ks_stat": metrics["ks_statistic"],
     }
