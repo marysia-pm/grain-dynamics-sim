@@ -1,7 +1,8 @@
 """Terrain generation and surface roughness models.
 
-Combines physical micro-geometry realism (tiled KD-Tree grain placement, random
-grain radius/offset distributions, and Sa surface roughness calibration) with
+Combines physical micro-geometry realism (tiled KD-Tree grain placement, lognormal
+grain-size distribution, true hemispherical grains, and Sa surface roughness
+calibration against measured Nanovea data) with
 the Terrain class structure and sharp regional transitions. Also supports
 procedural Galton board pin layouts and sandpaper micro-grains oriented
 normally to the slope.
@@ -9,32 +10,50 @@ normally to the slope.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 from scipy.interpolate import interp1d
-from scipy.ndimage import grey_dilation
+from scipy.ndimage import gaussian_filter, grey_dilation
+from scipy.optimize import brentq
 from scipy.spatial import cKDTree
 
-# Calibrated Nanovea profilometer dataset
-NANOVEA_DATA: dict[int, dict[str, float]] = {
-    80: {"d50_cm": 0.0201, "d50_um": 201.0},
-    120: {"d50_cm": 0.0125, "d50_um": 125.0},
-    180: {"d50_cm": 0.0082, "d50_um": 82.0},
-    240: {"d50_cm": 0.0053, "d50_um": 53.0},
-    320: {"d50_cm": 0.0046, "d50_um": 46.0},
-    400: {"d50_cm": 0.0035, "d50_um": 35.0},
-    600: {"d50_cm": 0.0025, "d50_um": 25.0},
-    800: {"d50_cm": 0.0021, "d50_um": 21.0},
-    1000: {"d50_cm": 0.0018, "d50_um": 18.0},
-    1200: {"d50_cm": 0.0015, "d50_um": 15.0},
-    2000: {"d50_cm": 0.0010, "d50_um": 10.0},
+# Measured NANOVEA ST400 profilometry data:
+# Frank Liu, "Sandpaper: Roughness & Particle Diameter Analysis" (NANOVEA app note),
+# Table 1 (Sa) and Table 2 (equivalent particle diameter, mean +/- std).
+# ONLY these five grits were measured. Any other grit (P80, P240, P400, ...) is
+# log-log interpolated/extrapolated from them, and outside P120-P2000 that is a guess.
+# NOTE: "d50" in the names below is kept for backwards compatibility; the Nanovea
+# value is the mean motif-equivalent diameter, not a true d50.
+NANOVEA_MEASURED: dict[int, dict[str, float]] = {
+    120: {"d_um": 127.0, "d_std_um": 48.7, "sa_um": 42.37},
+    180: {"d_um": 105.6, "d_std_um": 35.43, "sa_um": 27.28},
+    320: {"d_um": 67.18, "d_std_um": 22.62, "sa_um": 17.92},
+    800: {"d_um": 28.16, "d_std_um": 8.58, "sa_um": 6.273},
+    2000: {"d_um": 21.27, "d_std_um": 8.35, "sa_um": 3.639},
 }
 
-NANOVEA_GRIT_TABLE = np.array(list(NANOVEA_DATA.keys()), dtype=np.float64)
-NANOVEA_D50_CM_TABLE = np.array([v["d50_cm"] for v in NANOVEA_DATA.values()], dtype=np.float64)
+NANOVEA_DATA: dict[int, dict[str, float]] = {
+    grit: {
+        "d50_cm": v["d_um"] / 1e4,
+        "d50_um": v["d_um"],
+        "d_std_cm": v["d_std_um"] / 1e4,
+        "d_std_um": v["d_std_um"],
+        "sa_cm": v["sa_um"] / 1e4,
+        "sa_um": v["sa_um"],
+    }
+    for grit, v in NANOVEA_MEASURED.items()
+}
+
+NANOVEA_GRIT_TABLE = np.array(list(NANOVEA_DATA.keys()), dtype=np.float64)  # ascending
+NANOVEA_D50_CM_TABLE = np.array([v["d50_cm"] for v in NANOVEA_DATA.values()], dtype=np.float64)  # descending
+NANOVEA_SA_CM_TABLE = np.array([v["sa_cm"] for v in NANOVEA_DATA.values()], dtype=np.float64)
+NANOVEA_SIZE_CV_TABLE = np.array(
+    [v["d_std_cm"] / v["d50_cm"] for v in NANOVEA_DATA.values()], dtype=np.float64
+)  # coefficient of variation of grain diameter, ~0.30-0.39 for all measured grits
 
 _d50_from_grit_interp = interp1d(
     np.log10(NANOVEA_GRIT_TABLE),
@@ -52,7 +71,14 @@ _grit_from_d50_interp = interp1d(
 
 
 def nanovea_d50_from_grit(grit: float) -> float:
-    """Returns calibrated particle diameter d50 (cm) for a given P-grit."""
+    """Returns calibrated mean particle diameter (cm) for a given P-grit."""
+    if not (NANOVEA_GRIT_TABLE.min() <= float(grit) <= NANOVEA_GRIT_TABLE.max()):
+        warnings.warn(
+            f"P{float(grit):g} is outside NANOVEA's measured range "
+            f"(P{NANOVEA_GRIT_TABLE.min():g}-P{NANOVEA_GRIT_TABLE.max():g}); "
+            "grain size and Sa are extrapolated, not measured.",
+            stacklevel=2,
+        )
     log_d50 = _d50_from_grit_interp(np.log10(float(grit)))
     return float(10.0**log_d50)
 
@@ -68,29 +94,79 @@ def estimate_grit(d50_cm: float) -> float:
     return nanovea_grit_from_d50(d50_cm)
 
 
-# Real measured Nanovea profilometry Sa (areal roughness) reference points.
-# Previously this benchmark data only lived in a standalone exploring_surfaces.py
-# script and grain calibration elsewhere used a rough target_sa_cm = 0.33 * d50
-# heuristic instead. This table lets every surface calibrate against the actual
-# measured Sa, matching the surfaces produced by that exploration script.
-_NANOVEA_SA_REFERENCE_D50_CM = np.array([127.0, 105.6, 67.18, 28.16, 21.27], dtype=np.float64) / 10000.0
-_NANOVEA_SA_REFERENCE_SA_CM = np.array([42.37, 27.28, 17.92, 6.273, 3.639], dtype=np.float64) / 10000.0
-
 _sa_from_d50_interp = interp1d(
-    np.log10(_NANOVEA_SA_REFERENCE_D50_CM),
-    np.log10(_NANOVEA_SA_REFERENCE_SA_CM),
+    np.log10(NANOVEA_D50_CM_TABLE[::-1]),
+    np.log10(NANOVEA_SA_CM_TABLE[::-1]),
     kind="linear",
     fill_value="extrapolate",
 )
 
 
 def nanovea_sa_from_d50(d50_cm: float) -> float:
-    """Returns calibrated Sa areal roughness (cm) for a given particle diameter d50 (cm),
-    interpolated/extrapolated (log-log) from real Nanovea profilometry measurements."""
+    """Returns calibrated Sa areal roughness (cm) for a given mean particle diameter (cm),
+    interpolated/extrapolated (log-log) from the measured Nanovea points."""
     if d50_cm <= 0.0:
         return 0.0
     log_sa = _sa_from_d50_interp(np.log10(float(d50_cm)))
     return float(10.0**log_sa)
+
+
+def nanovea_size_cv_from_d50(d50_cm: float) -> float:
+    """Returns the relative std (std/mean) of grain diameter for a given mean diameter (cm),
+    linearly interpolated in log10(d) between the measured Nanovea points (clamped at the ends)."""
+    if d50_cm <= 0.0:
+        return 0.0
+    return float(
+        np.interp(
+            np.log10(float(d50_cm)),
+            np.log10(NANOVEA_D50_CM_TABLE[::-1]),
+            NANOVEA_SIZE_CV_TABLE[::-1],
+        )
+    )
+
+
+SA_CALIBRATION_MODES = ("waviness", "stretch", "none")
+
+
+def _match_sa_with_waviness(
+    z_bump: np.ndarray,
+    s_grid: np.ndarray,
+    y_grid: np.ndarray,
+    target_sa_cm: float,
+    corr_len_cm: float,
+    seed: int,
+) -> np.ndarray:
+    """Adds a smooth, zero-mean, spatially correlated height field to `z_bump` with
+    exactly the amplitude that brings its Sa up to `target_sa_cm`.
+
+    Grains keep their true hemispherical shape (no vertical stretching); the extra
+    height variation that Nanovea measures beyond a single layer of grain tops
+    (Sz is 3-5 grain diameters) is supplied by a long-wavelength component instead.
+    If the grain field already meets/exceeds the target Sa, it is returned unchanged.
+    """
+    mean_sa = lambda f: float(np.mean(np.abs(f - np.mean(f))))
+    if mean_sa(z_bump) >= target_sa_cm:
+        return z_bump
+
+    ds = float(s_grid[1] - s_grid[0]) if len(s_grid) > 1 else corr_len_cm
+    dy = float(y_grid[1] - y_grid[0]) if len(y_grid) > 1 else corr_len_cm
+    rng = np.random.default_rng(seed)
+    w = gaussian_filter(
+        rng.standard_normal(z_bump.shape),
+        sigma=(corr_len_cm / ds, corr_len_cm / dy),
+        mode="reflect",
+    )
+    w_std = float(w.std())
+    if w_std <= 0.0:
+        return z_bump
+    w = (w - w.mean()) / w_std
+
+    hi = target_sa_cm * 4.0
+    while mean_sa(z_bump + hi * w) < target_sa_cm:  # safety: Sa(A) grows ~0.8*A
+        hi *= 2.0
+    amp = brentq(lambda A: mean_sa(z_bump + A * w) - target_sa_cm, 0.0, hi, xtol=target_sa_cm * 1e-4)
+    out = z_bump + amp * w
+    return out - out.min()
 
 
 def _tiled_grain_bump_field(
@@ -100,14 +176,38 @@ def _tiled_grain_bump_field(
     slope_angle: float = 0.0,
     tile_size_cm: float = 0.20,
     seed: int = 42,
-    k_neighbors: int = 4,
+    k_neighbors: int = 6,
+    size_cv: float | None = None,
+    sa_calibration: str = "waviness",
+    waviness_length_diams: float = 3.0,
+    z_offset_sigma: float = 0.40,
 ) -> np.ndarray:
-    """Procedural grain-bump height field, tiled across (x_grid, y_grid) via local
-    KD-Tree grain placement. NOTE: this only resolves grain-scale detail when
-    the grid spacing is fine relative to d50_cm -- for a coarse, full-ramp grid
-    and small (high-grit) grains, most of the true grain texture aliases away.
-    See plot_ball_surface_closeup, which regenerates a dedicated fine patch for
-    visualization instead of relying on this function's grid resolution."""
+    """Procedural grain-bump height field (normal to the ramp), tiled across
+    (x_grid, y_grid) via local KD-Tree grain placement.
+
+    Each grain is a TRUE hemisphere (semi-axis ratio 1.0) of random radius, seated at
+    a random small vertical offset. Grain diameters follow a LOGNORMAL distribution
+    whose mean is `d50_cm` and whose relative std `size_cv` defaults to the measured
+    Nanovea value for that grit (~0.30-0.39). Lognormal is used because a Gaussian
+    with a ~38% spread would produce non-positive sizes and be badly distorted by
+    clipping; radii are only loosely clipped to [0.3, 2.5] x mean.
+
+    `sa_calibration` decides how the measured Nanovea Sa is reached:
+      * "waviness" (default): keep hemispheres, add a smooth correlated height
+        field (correlation length `waviness_length_diams` x grain diameter) for the
+        missing height variation. Grain shape and packing are untouched.
+      * "stretch": multiply all heights by target_Sa/Sa. Exact Sa, but turns
+        hemispheres into ellipsoids (up to ~2x too tall at coarse grits).
+      * "none": no calibration; Sa is whatever pure hemispheres give (~0.16 d).
+
+    NOTE: this only resolves grain-scale detail when the grid spacing is fine
+    relative to d50_cm -- for a coarse full-ramp grid most of the grain texture
+    aliases away. See plot_ball_surface_closeup, which regenerates a dedicated fine
+    patch for visualization.
+    """
+    if sa_calibration not in SA_CALIBRATION_MODES:
+        raise ValueError(f"sa_calibration must be one of {SA_CALIBRATION_MODES}, got '{sa_calibration}'")
+
     if d50_cm <= 0.0:
         return np.zeros((len(x_grid), len(y_grid)), dtype=float)
 
@@ -126,10 +226,13 @@ def _tiled_grain_bump_field(
     y_min, y_max = float(y_grid[0]), float(y_grid[-1])
 
     r_mean = d50_cm / 2.0
-    r_std = r_mean * 0.15
     spacing = r_mean * 1.35
     pad = r_mean * 3.0
-    z_aspect = 1.30
+    z_aspect = 1.0  # true hemispheres
+
+    cv = nanovea_size_cv_from_d50(d50_cm) if size_cv is None else float(size_cv)
+    ln_sigma = float(np.sqrt(np.log1p(cv**2)))
+    ln_mu = float(np.log(r_mean) - 0.5 * ln_sigma**2)  # lognormal with mean exactly r_mean
 
     target_sa_cm = nanovea_sa_from_d50(d50_cm)
 
@@ -170,8 +273,8 @@ def _tiled_grain_bump_field(
             cy = (GY + rng.uniform(-jitter, jitter, size=GY.shape)).ravel()
 
             n_grains = len(cs)
-            r_grains = np.clip(rng.normal(r_mean, r_std, size=n_grains), r_mean * 0.5, r_mean * 1.5)
-            z_offsets = rng.normal(0.0, r_mean * 0.40, size=n_grains)
+            r_grains = np.clip(rng.lognormal(ln_mu, ln_sigma, size=n_grains), r_mean * 0.3, r_mean * 2.5)
+            z_offsets = rng.normal(0.0, r_mean * z_offset_sigma, size=n_grains)
 
             tree = cKDTree(np.column_stack([cs, cy]))
             k_query = min(k_neighbors, n_grains)
@@ -211,9 +314,19 @@ def _tiled_grain_bump_field(
 
     z_bump -= z_bump.min()
 
-    current_sa = float(np.mean(np.abs(z_bump - np.mean(z_bump))))
-    if current_sa > 0:
-        z_bump *= target_sa_cm / current_sa
+    if sa_calibration == "stretch":
+        current_sa = float(np.mean(np.abs(z_bump - np.mean(z_bump))))
+        if current_sa > 0:
+            z_bump *= target_sa_cm / current_sa
+    elif sa_calibration == "waviness":
+        z_bump = _match_sa_with_waviness(
+            z_bump,
+            s_grid,
+            y_grid,
+            target_sa_cm,
+            corr_len_cm=waviness_length_diams * d50_cm,
+            seed=seed + 10_000,
+        )
 
     return z_bump
 
@@ -609,6 +722,9 @@ def generate_terrain(cfg: Any) -> Terrain:
 
     tile_size_cm = float(getattr(cfg, "tile_size_cm", 0.20))
     surface_type = str(getattr(cfg, "surface_type", "sandpaper")).lower()
+    sa_calibration = str(getattr(cfg, "sa_calibration", "waviness"))
+    grain_size_cv = getattr(cfg, "grain_size_cv", None)  # None -> measured Nanovea CV per grit
+    waviness_length_diams = float(getattr(cfg, "waviness_length_diams", 3.0))
 
     x = np.linspace(0, x_len, res_x)
     y = np.linspace(0, y_len, res_y)
@@ -647,15 +763,18 @@ def generate_terrain(cfg: Any) -> Terrain:
             shape=peg_shape,
         )
     else:
-        rough_field = _tiled_grain_bump_field(
-            x, y, amp_rough, slope_angle=slope_angle, tile_size_cm=tile_size_cm, seed=seed
+        grain_kw = dict(
+            slope_angle=slope_angle,
+            tile_size_cm=tile_size_cm,
+            size_cv=grain_size_cv,
+            sa_calibration=sa_calibration,
+            waviness_length_diams=waviness_length_diams,
         )
+        rough_field = _tiled_grain_bump_field(x, y, amp_rough, seed=seed, **grain_kw)
         if np.isclose(amp_rough, amp_smooth):
             normal_roughness = rough_field
         else:
-            smooth_field = _tiled_grain_bump_field(
-                x, y, amp_smooth, slope_angle=slope_angle, tile_size_cm=tile_size_cm, seed=seed + 1
-            )
+            smooth_field = _tiled_grain_bump_field(x, y, amp_smooth, seed=seed + 1, **grain_kw)
             normal_roughness = np.where(yy < y_trans, rough_field, smooth_field)
 
     z_offset_cfg = getattr(cfg, "z_offset", None)
@@ -721,9 +840,16 @@ def generate_calibrated_sandpaper(
     resolution_y: int | None = None,
     tile_size_cm: float = 0.20,
     seed: int = 42,
+    sa_calibration: str = "waviness",
+    grain_size_cv: float | None = None,
+    waviness_length_diams: float = 3.0,
     **kwargs: Any,
 ) -> Terrain:
     """Generates a calibrated sandpaper Terrain instance directly from P-grit specifications.
+
+    `sa_calibration` ("waviness" | "stretch" | "none") selects how the measured Sa is
+    reached (see _tiled_grain_bump_field); `grain_size_cv` overrides the measured
+    grain-diameter spread (None = Nanovea value for the grit).
 
     `resolution` sets both grid axes; pass `resolution_x`/`resolution_y` to use a
     different point count per axis (useful for long/narrow ramps).
@@ -751,6 +877,9 @@ def generate_calibrated_sandpaper(
         roughness_transition_y=length_y / 2.0,
         tile_size_cm=tile_size_cm,
         seed=seed,
+        sa_calibration=sa_calibration,
+        grain_size_cv=grain_size_cv,
+        waviness_length_diams=waviness_length_diams,
     )
     return generate_terrain(cfg)
 

@@ -65,7 +65,7 @@ class BallConfig:
     vz0: float = 0.0
     radius: float = 0.125  # cm
     mass: float = 0.02  # g
-    restitution: float = 0.5
+    restitution: float = 0.8
     friction_mu: float = 0.0
 
 

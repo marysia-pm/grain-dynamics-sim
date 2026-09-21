@@ -660,16 +660,11 @@ def plot_trajectories_and_three_slices(
         valid_e, valid_s = slice_data[idx]
         is_last = idx == len(x_slices) - 1
 
-        if len(valid_e) > 0:
-            ax_slice.hist(valid_e, bins=12, density=True, alpha=0.4, color="#1e88e5", label="Exp")
-        if len(valid_s) > 0:
-            ax_slice.hist(valid_s, bins=12, density=True, alpha=0.4, color="#ffb300", label="Sim")
-
         if is_last:
             for valid, color, label in [(valid_e, "#0d47a1", "Exp"), (valid_s, "#ff6f00", "Sim")]:
                 if len(valid) > 2 and np.std(valid) > 1e-9:
                     grid = np.linspace(*shared_xlim, 200)
-                    if is_dual and len(valid) >= 10:
+                    if is_dual and len(valid) >= 5:
                         # A dual-grit surface has two different roughnesses either
                         # side of the interface, so the downstream Y-distribution
                         # is naturally two-humped rather than a single Gaussian --
@@ -690,6 +685,11 @@ def plot_trajectories_and_three_slices(
                             lw=2.0,
                             label=rf"{label} fit: $\mu$={mu:.2f}, $\sigma$={sigma:.2f}",
                         )
+
+        if len(valid_e) > 0:
+            ax_slice.hist(valid_e, bins=12, density=True, alpha=0.4, color="#1e88e5", label="Exp")
+        if len(valid_s) > 0:
+            ax_slice.hist(valid_s, bins=12, density=True, alpha=0.4, color="#ffb300", label="Sim")
 
         if is_dual:
             ax_slice.axvline(interface_y, color="black", linestyle="-.", lw=1.2)
@@ -724,24 +724,53 @@ def plot_count_by_side_over_time(
     n_smooth: np.ndarray,
     n_active: np.ndarray | None = None,
     interface_y: float | None = None,
+    exp_time_axis: np.ndarray | None = None,
+    exp_n_rough: np.ndarray | None = None,
+    exp_n_smooth: np.ndarray | None = None,
+    exp_n_active: np.ndarray | None = None,
 ) -> Figure:
     """Plots how many balls are currently on each side of the rough/smooth
     interface over time -- one side falling while the other rises is the
     signature of a net flux of particles crossing between the two textures.
+
+    If exp_* arrays are given, experimental data is drawn in a second panel
+    rather than overlaid on the same axis: experimental trajectories carry a
+    raw frame index as their time-like axis, not real seconds (no capture
+    frame rate is known anywhere in this codebase), so a shared x-axis would
+    falsely imply frame number and seconds are the same unit.
     """
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(time_axis, n_rough, color="#8d5524", lw=2.0, label="Rough side")
-    ax.plot(time_axis, n_smooth, color="#1e88e5", lw=2.0, label="Smooth side")
+    has_exp = exp_time_axis is not None and len(exp_time_axis) > 0
+    fig, axes = plt.subplots(1, 2 if has_exp else 1, figsize=(13 if has_exp else 7, 4.5))
+    ax_sim = axes[0] if has_exp else axes
+
+    ax_sim.plot(time_axis, n_rough, color="#8d5524", lw=2.0, label="Rough side")
+    ax_sim.plot(time_axis, n_smooth, color="#1e88e5", lw=2.0, label="Smooth side")
     if n_active is not None:
-        ax.plot(time_axis, n_active, color="gray", lw=1.2, linestyle=":", label="Total active")
-    ax.set_xlabel("Time (s)", fontweight="bold")
-    ax.set_ylabel("Number of balls", fontweight="bold")
+        ax_sim.plot(time_axis, n_active, color="gray", lw=1.2, linestyle=":", label="Total active")
+    ax_sim.set_xlabel("Time (s)", fontweight="bold")
+    ax_sim.set_ylabel("Number of balls", fontweight="bold")
+    ax_sim.set_title("Simulation" if has_exp else "", fontweight="bold")
+    ax_sim.legend(loc="best")
+    ax_sim.grid(True, linestyle=":", alpha=0.6)
+
+    if has_exp:
+        ax_exp = axes[1]
+        ax_exp.plot(exp_time_axis, exp_n_rough, color="#8d5524", lw=2.0, label="Rough side")
+        ax_exp.plot(exp_time_axis, exp_n_smooth, color="#1e88e5", lw=2.0, label="Smooth side")
+        if exp_n_active is not None:
+            ax_exp.plot(
+                exp_time_axis, exp_n_active, color="gray", lw=1.2, linestyle=":", label="Total active"
+            )
+        ax_exp.set_xlabel("Frame", fontweight="bold")
+        ax_exp.set_ylabel("Number of balls", fontweight="bold")
+        ax_exp.set_title("Experiment", fontweight="bold")
+        ax_exp.legend(loc="best")
+        ax_exp.grid(True, linestyle=":", alpha=0.6)
+
     title = "Ball Count by Surface Side Over Time"
     if interface_y is not None:
         title += f" (interface at Y={interface_y:.1f} cm)"
-    ax.set_title(title, fontweight="bold", pad=12)
-    ax.legend(loc="best")
-    ax.grid(True, linestyle=":", alpha=0.6)
+    fig.suptitle(title, fontweight="bold")
     plt.tight_layout()
     return fig
 
@@ -752,6 +781,9 @@ def plot_variance_by_side_over_time(
     var_smooth: np.ndarray,
     D_rough: float | None = None,
     D_smooth: float | None = None,
+    exp_time_axis: np.ndarray | None = None,
+    exp_var_rough: np.ndarray | None = None,
+    exp_var_smooth: np.ndarray | None = None,
 ) -> Figure:
     """Plots Y-position variance over time, computed separately among whichever
     balls are currently on each side of the interface -- shows directly
@@ -760,17 +792,39 @@ def plot_variance_by_side_over_time(
     the legend as apparent/effective values -- see that function's docstring
     for why these are a biased approximation, not a rigorous measurement, of
     each side's true local diffusivity.
+
+    If exp_* arrays are given, experimental data is drawn in a second panel on
+    its own frame-based x-axis (see plot_count_by_side_over_time for why it
+    isn't overlaid on the same axis as sim's real-seconds one). No D value is
+    annotated for the experimental panel: a slope fit there would come out in
+    cm^2/frame, which isn't a meaningful physical diffusivity without a known
+    capture frame rate to convert frames to seconds.
     """
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    has_exp = exp_time_axis is not None and len(exp_time_axis) > 0
+    fig, axes = plt.subplots(1, 2 if has_exp else 1, figsize=(13 if has_exp else 7, 4.5))
+    ax_sim = axes[0] if has_exp else axes
+
     label_r = "Rough side" + (f" (apparent D={D_rough:.3f} cm$^2$/s)" if D_rough is not None else "")
     label_s = "Smooth side" + (f" (apparent D={D_smooth:.3f} cm$^2$/s)" if D_smooth is not None else "")
-    ax.plot(time_axis, var_rough, color="#8d5524", lw=2.0, label=label_r)
-    ax.plot(time_axis, var_smooth, color="#1e88e5", lw=2.0, label=label_s)
-    ax.set_xlabel("Time (s)", fontweight="bold")
-    ax.set_ylabel("Var(Y) (cm$^2$)", fontweight="bold")
-    ax.set_title("Lateral Position Variance by Surface Side", fontweight="bold", pad=12)
-    ax.legend(loc="best")
-    ax.grid(True, linestyle=":", alpha=0.6)
+    ax_sim.plot(time_axis, var_rough, color="#8d5524", lw=2.0, label=label_r)
+    ax_sim.plot(time_axis, var_smooth, color="#1e88e5", lw=2.0, label=label_s)
+    ax_sim.set_xlabel("Time (s)", fontweight="bold")
+    ax_sim.set_ylabel("Var(Y) (cm$^2$)", fontweight="bold")
+    ax_sim.set_title("Simulation" if has_exp else "", fontweight="bold")
+    ax_sim.legend(loc="best")
+    ax_sim.grid(True, linestyle=":", alpha=0.6)
+
+    if has_exp:
+        ax_exp = axes[1]
+        ax_exp.plot(exp_time_axis, exp_var_rough, color="#8d5524", lw=2.0, label="Rough side")
+        ax_exp.plot(exp_time_axis, exp_var_smooth, color="#1e88e5", lw=2.0, label="Smooth side")
+        ax_exp.set_xlabel("Frame", fontweight="bold")
+        ax_exp.set_ylabel("Var(Y) (cm$^2$)", fontweight="bold")
+        ax_exp.set_title("Experiment", fontweight="bold")
+        ax_exp.legend(loc="best")
+        ax_exp.grid(True, linestyle=":", alpha=0.6)
+
+    fig.suptitle("Lateral Position Variance by Surface Side", fontweight="bold")
     plt.tight_layout()
     return fig
 

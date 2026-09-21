@@ -35,7 +35,6 @@ from rough_slope_sim.analysis import (
 from rough_slope_sim.plotting import (
     plot_ball_surface_closeup,
     plot_count_by_side_over_time,
-    plot_experiment_vs_sim_distribution,
     plot_terrain_3d,
     plot_trajectories_3d,
     plot_trajectories_and_three_slices,
@@ -277,7 +276,7 @@ def process_folder(
     )
     sampled_initial_states = [(0.1, float(y0), 0.0, 0.0) for y0 in sim_y0_vals]
     tqdm.write(f"  ├── Loaded Tracks  : {len(exp_trajs)} trajectories (X release aligned to 0.1 cm)")
-    tqdm.write(f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0] cm")
+    tqdm.write(f"  ├── Initial Config : Fixed X0 = 0.1 cm, V0 = 0.0")
 
     # 2. Construct TerrainConfig with dynamic seam boundary
     t_cfg = TerrainConfig(
@@ -336,10 +335,6 @@ def process_folder(
     y_exp_15 = trajectories_at_x_slice(exp_trajs, 15.0)
     y_sim_15 = trajectories_at_x_slice(sim_trajs, 15.0)
 
-    fig_hist = plot_experiment_vs_sim_distribution(y_exp_15, y_sim_15, x_slice=15.0)
-    fig_hist.savefig(sub_out / "03_histogram_15cm.png", dpi=150, bbox_inches="tight")
-    plt.close(fig_hist)
-
     # 4. Render trajectory slice plot using the exact interface y-location
     fig_slices = plot_trajectories_and_three_slices(
         exp_trajs,
@@ -365,9 +360,26 @@ def process_folder(
         # These plots/metrics only make sense for a dual-grit surface with an
         # actual rough/smooth interface. Flux plot: does one side's ball count
         # fall while the other's rises (net migration across the interface)?
+        # Experimental trajectories are included too, but on their own panel
+        # with a frame-based x-axis, since their time-like column is a raw
+        # frame index (no capture frame rate is known anywhere in this
+        # codebase, so it can't be honestly converted to seconds).
         t_axis, n_rough, n_smooth, n_active = count_on_side_over_time(sim_trajs, interface_y=seam_y)
-        fig_flux = plot_count_by_side_over_time(t_axis, n_rough, n_smooth, n_active, interface_y=seam_y)
-        fig_flux.savefig(sub_out / "05_flux_by_side.png", dpi=300, bbox_inches="tight")
+        exp_flux_kwargs = {}
+        if len(exp_trajs) > 0:
+            t_axis_e, n_rough_e, n_smooth_e, n_active_e = count_on_side_over_time(
+                exp_trajs, interface_y=seam_y
+            )
+            exp_flux_kwargs = dict(
+                exp_time_axis=t_axis_e,
+                exp_n_rough=n_rough_e,
+                exp_n_smooth=n_smooth_e,
+                exp_n_active=n_active_e,
+            )
+        fig_flux = plot_count_by_side_over_time(
+            t_axis, n_rough, n_smooth, n_active, interface_y=seam_y, **exp_flux_kwargs
+        )
+        fig_flux.savefig(sub_out / "05_flux_by_side.png", dpi=150, bbox_inches="tight")
         plt.close(fig_flux)
 
         # local_diffusion_coefficient_from_increments is the primary, accurate
@@ -388,8 +400,14 @@ def process_folder(
         t_axis2, var_r, var_s, n_r2, n_s2 = variance_over_time_by_side(sim_trajs, interface_y=seam_y)
         d_rough_apparent = estimate_diffusion_from_variance_slope(t_axis2, var_r)
         d_smooth_apparent = estimate_diffusion_from_variance_slope(t_axis2, var_s)
+        exp_var_kwargs = {}
+        if len(exp_trajs) > 0:
+            t_axis2_e, var_r_e, var_s_e, n_r2_e, n_s2_e = variance_over_time_by_side(
+                exp_trajs, interface_y=seam_y
+            )
+            exp_var_kwargs = dict(exp_time_axis=t_axis2_e, exp_var_rough=var_r_e, exp_var_smooth=var_s_e)
         fig_var_side = plot_variance_by_side_over_time(
-            t_axis2, var_r, var_s, d_rough_apparent, d_smooth_apparent
+            t_axis2, var_r, var_s, d_rough_apparent, d_smooth_apparent, **exp_var_kwargs
         )
         fig_var_side.savefig(sub_out / "06_variance_by_side.png", dpi=150, bbox_inches="tight")
         plt.close(fig_var_side)
